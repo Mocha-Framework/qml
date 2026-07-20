@@ -74,29 +74,18 @@ export function generateQMLSource(
   let qml = metadata.options.qml;
 
   // Transform controller.xxx bindings via global regex — robust against parser quirks
-  qml = qml.replace(/controller\.(\w+)\.value\b/g, 'controller.get("$1")');
+  qml = qml.replace(/controller\.(\w+)\.value\b/g, 'controller.$1');
   qml = qml.replace(/controller\.(\w+)\s*\(\)/g, 'controller.bridgeCall("$1")');
 
-  // If proxies exist, inject bridgeSeq bridge for reactive dependency
+  // Transform .get("X") calls to direct property access
+  // QQmlPropertyMap exposes dynamic properties with automatic valueChanged signals,
+  // so QML's binding engine tracks them natively — no comma-operator tricks needed.
   if (rootProxies && rootProxies.length > 0) {
     for (const proxy of rootProxies) {
-      const bridgeExpr = `readonly property int _bridge_${proxy.componentName}: ${proxy.componentName}.bridgeSeq`;
-      if (!qml.includes(bridgeExpr)) {
-        const braceIdx = qml.indexOf("{");
-        if (braceIdx >= 0) {
-          const before = qml.slice(0, braceIdx + 1);
-          const after = qml.slice(braceIdx + 1);
-          qml = `${before}\n    ${bridgeExpr}${after}`;
-        }
-      }
-
-      // Wrap .get("X") calls with bridge dependency so QML bindings re-evaluate
-      // QML only tracks property reads, not Q_INVOKABLE method calls.
-      // The comma operator reads bridgeSeq (property → tracked) and returns get().
       const name = proxy.componentName;
       qml = qml.replace(
         new RegExp(name + '\\.get\\("([^"]*)"\\)', 'g'),
-        `(${name}.bridgeSeq, ${name}.get("$1"))`
+        `${name}.$1`
       );
     }
   }
@@ -165,9 +154,9 @@ export function generateQMLFile(
   metadata: QMLComponentMetadata
 ): string {
   const header = [
-    "import QtQuick 2.15",
-    "import QtQuick.Controls 2.15",
-    "import QtQuick.Layouts 1.15",
+    "import QtQuick",
+    "import QtQuick.Controls",
+    "import QtQuick.Layouts",
   ].join("\n");
 
   const body = generateQMLSource(component, metadata);
