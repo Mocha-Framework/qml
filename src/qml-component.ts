@@ -90,6 +90,22 @@ export function generateQMLSource(
     }
   }
 
+  // Inject objectName for every id so viewChild/findChild works via C++ bridge
+  {
+    const lines = qml.split("\n");
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      const idMatch = line.match(/\bid:\s*"(\w+)"|\bid:\s*(\w+)/);
+      const idName = idMatch?.[1] ?? idMatch?.[2];
+      if (idName && !line.includes("objectName:")) {
+        const indent = (line.match(/^(\s*)/)?.[1] ?? "    ");
+        lines.splice(i + 1, 0, `${indent}objectName: "${idName}"`);
+        i++;
+      }
+    }
+    qml = lines.join("\n");
+  }
+
   // Auto-inject Router lifecycle hooks if controller has routeLeave/routeEnter
   const hasLeave = typeof (component as any).routeLeave === "function";
   const hasEnter = typeof (component as any).routeEnter === "function";
