@@ -26,6 +26,7 @@ export abstract class QMLNode {
 
 export class QMLTextField extends QMLNode {
   get text(): string { return this.getProperty("text"); }
+  set text(v: string) { this.setProperty("text", v); }
 }
 
 export class QMLTextInput extends QMLNode {
