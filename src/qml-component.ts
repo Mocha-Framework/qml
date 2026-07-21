@@ -135,6 +135,12 @@ export function generateQMLSource(
 
     const elementBindings: Record<string, { signal: string; prop: string }> = {
       TextField: { signal: "onTextChanged", prop: "text" },
+      TextInput: { signal: "onTextEdited", prop: "text" },
+      TextArea: { signal: "onTextChanged", prop: "text" },
+      Checkbox: { signal: "onCheckedChanged", prop: "checked" },
+      Switch: { signal: "onCheckedChanged", prop: "checked" },
+      Slider: { signal: "onValueChanged", prop: "value" },
+      SpinBox: { signal: "onValueChanged", prop: "value" },
     };
 
     const lines = qml.split("\n");

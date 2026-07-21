@@ -28,11 +28,15 @@ export function resolveViewChild<T extends QMLNode>(
   ref: ViewChildRef<T>
 ): T | null {
   if (!_nativeAppRef) return null;
-  const handle = _nativeAppRef.findChild(ref.selector);
-  if (!handle) return null;
-  const wrapper = new ref.wrapperClass();
-  wrapper._attach(_nativeAppRef, handle);
-  return wrapper;
+  try {
+    const handle = _nativeAppRef.findChild(ref.selector);
+    if (!handle) return null;
+    const wrapper = new ref.wrapperClass();
+    wrapper._attach(_nativeAppRef, handle);
+    return wrapper;
+  } catch {
+    return null;
+  }
 }
 
 export function createLazyViewChild<T extends QMLNode>(
