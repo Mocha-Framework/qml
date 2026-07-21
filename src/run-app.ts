@@ -90,7 +90,11 @@ export async function runApp<T extends QObject>(
 
   await bindControllerToQML(ctx);
 
-  await startDebugServer(ctx);
+  try {
+    await startDebugServer(ctx);
+  } catch (err) {
+    logger.warn(`Debug server failed to start (app will run without debugger): ${(err as any)?.message ?? err}`);
+  }
 
   if (options?.watch || process.env.MOCHA_ENV === "development") {
     startWatchMode(ctx);
@@ -99,7 +103,7 @@ export async function runApp<T extends QObject>(
   await runEventLoop(nativeApp, ctx.proxyEntries);
 
   if (_debugServer) {
-    await _debugServer.stop();
+    try { await _debugServer.stop(); } catch {}
   }
 }
 
