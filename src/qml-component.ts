@@ -66,6 +66,48 @@ export function getAllQMLComponents(): Map<Function, QMLComponentMetadata> {
   return new Map(componentRegistry);
 }
 
+export function generateInnerQML(
+  qml: string,
+  templateForImports?: string
+): { innerQML: string; imports: string[] } {
+  const importSource = templateForImports || qml;
+  const imports: string[] = [];
+  const importRegex = /^\s*(import\s+.+)$/gm;
+  let match;
+  while ((match = importRegex.exec(importSource)) !== null) {
+    imports.push(match[1].trim());
+  }
+
+  const stripped = qml.replace(/^\s*import\s+.+$/gm, "").trim();
+  const rootMatch = stripped.match(/^\s*(?:Window|ApplicationWindow)\s*\{/);
+  if (!rootMatch) {
+    return { innerQML: qml, imports };
+  }
+
+  const rootOpen = stripped.indexOf("{") + 1;
+  let depth = 1;
+  let i = rootOpen;
+  while (i < stripped.length && depth > 0) {
+    if (stripped[i] === "{") depth++;
+    if (stripped[i] === "}") depth--;
+    i++;
+  }
+
+  const body = stripped.slice(rootOpen, i - 1);
+
+  const lines = body.split("\n");
+  let startIdx = 0;
+  for (let j = 0; j < lines.length; j++) {
+    const line = lines[j].trim();
+    if (line.match(/^\w+\s*\{/)) {
+      startIdx = j;
+      break;
+    }
+  }
+  const innerQML = lines.slice(startIdx).join("\n").trim();
+  return { innerQML, imports };
+}
+
 export function generateQMLSource(
   component: QObject,
   metadata: QMLComponentMetadata,

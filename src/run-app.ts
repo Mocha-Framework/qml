@@ -1,6 +1,6 @@
 import { Logger } from "@mocha/shared";
 import { QObject, QProperty, effect, globalContainer, DebugServer } from "@mocha/core";
-import { getQMLComponentMetadata, getAllQMLComponents, generateQMLSource, type ProxyEntry } from "./qml-component.js";
+import { getQMLComponentMetadata, getAllQMLComponents, generateQMLSource, generateInnerQML, type ProxyEntry } from "./qml-component.js";
 import { setNativeAppRef, createLazyViewChild, type ViewChildRef } from "./view-child.js";
 import * as fs from "node:fs";
 import * as path from "node:path";
@@ -41,7 +41,10 @@ interface AppContext {
   componentClass: any;
   options?: RunAppOptions;
   propsSnapshot: Map<string, unknown>;
+  shellLoaded: boolean;
 }
+
+let _currentCtx: AppContext | null = null;
 
 export async function runApp<T extends QObject>(
   componentClass: new (...args: any[]) => T,
@@ -53,6 +56,14 @@ export async function runApp<T extends QObject>(
       `No QML metadata found for "${componentClass.name}". ` +
       "Did you forget the @QMLComponent decorator?"
     );
+  }
+
+  if (_currentCtx) {
+    logger.info(`[HMR] runApp() called again — reusing existing ctx (shellLoaded=${_currentCtx.shellLoaded})`);
+    _currentCtx.componentClass = componentClass;
+    if (options) _currentCtx.options = options;
+    await bindControllerToQML(_currentCtx);
+    return;
   }
 
   let nativeApp: any = null;
@@ -86,7 +97,9 @@ export async function runApp<T extends QObject>(
     componentClass,
     options,
     propsSnapshot: new Map(),
+    shellLoaded: false,
   };
+  _currentCtx = ctx;
 
   await bindControllerToQML(ctx);
 
@@ -109,7 +122,7 @@ export async function runApp<T extends QObject>(
 
 async function bindControllerToQML(ctx: AppContext): Promise<void> {
   const { nativeApp } = ctx;
-  ctx.proxyEntries = [];
+  ctx.proxyEntries.length = 0;
 
   const rootServices = scanRootServices();
   for (const service of rootServices) {
@@ -166,12 +179,30 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
   ].join("\n");
   logger.info(`[QML generated] ${qmlWithImports.length} bytes, preview: ${qmlWithImports.slice(0, 300).replace(/\n/g, "\\n")}`);
 
-  if (typeof nativeApp.reloadQML === "function" && ctx.meta !== newMeta) {
-    nativeApp.reloadQML(qmlWithImports, ctx.options?.basePath || process.cwd());
-    ctx.meta = newMeta;
+  const { innerQML: inner, imports: innerImports } = generateInnerQML(qmlSource, newMeta.options.qml);
+  const allImports = [...new Set([
+    "import QtQuick",
+    "import QtQuick.Controls",
+    "import QtQuick.Layouts",
+    ...innerImports,
+    ...(newMeta.options.imports || []),
+  ])];
+  const innerWithImports = [...allImports, "", inner].join("\n");
+
+  logger.info(`[HMR shell] innerQML=${inner.length}b, imports=[${allImports.join(", ")}], shellLoaded=${ctx.shellLoaded}`);
+  logger.info(`[HMR shell] content preview: ${innerWithImports.slice(0, 500).replace(/\n/g, "\\n")}`);
+
+  if (!ctx.shellLoaded) {
+    ctx.nativeApp.loadShell(ctx.options?.basePath || process.cwd());
+    ctx.shellLoaded = true;
+    ctx.nativeApp.setShellSource(innerWithImports);
+    extractWindowProps(qmlSource, ctx.nativeApp);
   } else {
-    nativeApp.loadQML(qmlWithImports, ctx.options?.basePath || process.cwd());
+    ctx.nativeApp.setShellSource(innerWithImports);
+    extractWindowProps(qmlSource, ctx.nativeApp);
   }
+
+  ctx.meta = newMeta;
 
   applyDarkTitleBar(nativeApp);
 
@@ -195,7 +226,7 @@ function startWatchMode(ctx: AppContext): void {
 
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
 
-  fs.watch(srcDir, { recursive: true }, async (_event, filename) => {
+  const handleFileChange = async (filename: string) => {
     if (!filename || !filename.endsWith(".qml.ts")) return;
 
     if (reloadTimer) clearTimeout(reloadTimer);
@@ -224,9 +255,44 @@ function startWatchMode(ctx: AppContext): void {
         logger.error(`[HMR] Reload failed: ${filename}`, err);
       }
     }, 100);
-  });
+  };
 
-  logger.info(`[HMR] Watching ${srcDir} for .qml.ts changes...`);
+  // Primary: fs.watch (event-driven, instant)
+  try {
+    const watcher = fs.watch(srcDir, { recursive: true }, (_event, filename) => {
+      if (filename) handleFileChange(filename);
+    });
+    watcher.on("error", (err) => {
+      logger.warn(`[HMR] fs.watch error: ${(err as any)?.message ?? err} — falling back to polling`);
+      startPollingFallback(srcDir, handleFileChange);
+    });
+    logger.info(`[HMR] Watching ${srcDir} for .qml.ts changes (fs.watch)...`);
+  } catch (err) {
+    logger.warn(`[HMR] fs.watch failed: ${(err as any)?.message ?? err} — using polling`);
+    startPollingFallback(srcDir, handleFileChange);
+  }
+}
+
+function startPollingFallback(srcDir: string, onChange: (filename: string) => void): void {
+  // Poll all .qml.ts files in the directory using fs.watchFile (stat-based)
+  const files: string[] = [];
+  try {
+    for (const entry of fs.readdirSync(srcDir, { recursive: true })) {
+      const name = String(entry);
+      if (name.endsWith(".qml.ts")) {
+        files.push(name);
+        const fullPath = path.join(srcDir, name);
+        fs.watchFile(fullPath, { interval: 500 }, (curr, prev) => {
+          if (curr.mtimeMs !== prev.mtimeMs) {
+            onChange(name);
+          }
+        });
+      }
+    }
+    logger.info(`[HMR] Polling ${files.length} .qml.ts files in ${srcDir}...`);
+  } catch (err) {
+    logger.error(`[HMR] Polling setup failed: ${(err as any)?.message ?? err}`);
+  }
 }
 
 function findComponentClass(mod: any): any | null {
@@ -378,6 +444,17 @@ function scanProperties(instance: QObject): Array<{ name: string; qp: QProperty 
   return props;
 }
 
+function extractWindowProps(qml: string, nativeApp: any): void {
+  const titleMatch = qml.match(/title:\s*["']([^"']+)["']/);
+  const widthMatch = qml.match(/width:\s*(\d+)/);
+  const heightMatch = qml.match(/height:\s*(\d+)/);
+  nativeApp.setShellWindowProps({
+    title: titleMatch?.[1],
+    width: widthMatch ? parseInt(widthMatch[1]) : undefined,
+    height: heightMatch ? parseInt(heightMatch[1]) : undefined,
+  });
+}
+
 function resolveViewChildren(controller: QObject): void {
   const proto = Object.getPrototypeOf(controller);
   const keys = Object.getOwnPropertyNames(controller).concat(
@@ -416,11 +493,37 @@ function applyDarkTitleBar(nativeApp: any): void {
 function injectThemeOverrides(nativeApp: any, theme: ThemeLike): void {
   const overrides = theme.toQMLOverrides();
   const proxyId = nativeApp.createProxy();
+  _brandThemeProxyId = proxyId;
+  _brandThemeNativeApp = nativeApp;
   for (const [key, value] of Object.entries(overrides)) {
     nativeApp.proxySetValue(proxyId, key, value);
   }
   nativeApp.setContextProperty("_brandTheme", proxyId);
   logger.info(`[theme] Injected ${Object.keys(overrides).length} brand theme overrides`);
+}
+
+let _brandThemeProxyId: number | null = null;
+let _brandThemeNativeApp: any = null;
+
+export function switchTheme(theme: ThemeLike): void {
+  const nativeApp = _brandThemeNativeApp;
+  if (!nativeApp) {
+    logger.warn("[theme] Cannot switch — no native app reference. Call runApp with a theme first.");
+    return;
+  }
+
+  if (_brandThemeProxyId === null) {
+    const proxyId = nativeApp.createProxy();
+    _brandThemeProxyId = proxyId;
+    nativeApp.setContextProperty("_brandTheme", proxyId);
+    logger.info("[theme] Created brand theme proxy for live switching");
+  }
+
+  const overrides = theme.toQMLOverrides();
+  for (const [key, value] of Object.entries(overrides)) {
+    nativeApp.proxySetValue(_brandThemeProxyId, key, value);
+  }
+  logger.info(`[theme] Switched to ${Object.keys(overrides).length} brand theme overrides`);
 }
 
 function createMockNativeApp() {
@@ -439,5 +542,8 @@ function createMockNativeApp() {
     getRootObject: () => 0,
     setDarkTitleBar: () => {},
     startSystemMove: () => {},
+    loadShell: () => {},
+    setShellSource: () => {},
+    setShellWindowProps: () => {},
   };
 }
