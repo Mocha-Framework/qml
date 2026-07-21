@@ -16,7 +16,8 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@mocha/core": "*",
-    "@mocha/shared": "*"
+    "@mocha/core": "workspace:*",
+    "@mocha/native": "workspace:*",
+    "@mocha/shared": "workspace:*"
   }
 }

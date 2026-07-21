@@ -2,6 +2,13 @@ import { Logger } from "@mocha/shared";
 import { QObject, QProperty, effect, globalContainer, DebugServer } from "@mocha/core";
 import { getQMLComponentMetadata, getAllQMLComponents, generateQMLSource, type ProxyEntry } from "./qml-component.js";
 import { setNativeAppRef, createLazyViewChild, type ViewChildRef } from "./view-child.js";
+import * as fs from "node:fs";
+import * as path from "node:path";
+
+// ThemeData interface — duck-typed, avoids composit-build import issues with @mocha/tokens
+export interface ThemeLike {
+  toQMLOverrides(): Record<string, string>;
+}
 
 const logger = new Logger("runApp");
 
@@ -16,12 +23,24 @@ export interface RunAppOptions {
   onReady?: () => void;
   devtools?: DevToolsIntegration;
   fallbackMode?: "warn" | "error" | "silent";
+  watch?: boolean;
+  theme?: ThemeLike;
 }
 
 export interface DevToolsIntegration {
   port?: number;
   host?: string;
   autoStart?: boolean;
+}
+
+interface AppContext {
+  nativeApp: any;
+  proxyEntries: ProxyEntry[];
+  controller: any;
+  meta: any;
+  componentClass: any;
+  options?: RunAppOptions;
+  propsSnapshot: Map<string, unknown>;
 }
 
 export async function runApp<T extends QObject>(
@@ -57,15 +76,41 @@ export async function runApp<T extends QObject>(
     }
     nativeApp = createMockNativeApp();
   }
-    setNativeAppRef(nativeApp);
+  setNativeAppRef(nativeApp);
 
-  const proxyEntries: ProxyEntry[] = [];
+  const ctx: AppContext = {
+    nativeApp,
+    proxyEntries: [],
+    controller: null,
+    meta,
+    componentClass,
+    options,
+    propsSnapshot: new Map(),
+  };
 
-  // ── Root services ──
+  await bindControllerToQML(ctx);
+
+  await startDebugServer(ctx);
+
+  if (options?.watch || process.env.MOCHA_ENV === "development") {
+    startWatchMode(ctx);
+  }
+
+  await runEventLoop(nativeApp, ctx.proxyEntries);
+
+  if (_debugServer) {
+    await _debugServer.stop();
+  }
+}
+
+async function bindControllerToQML(ctx: AppContext): Promise<void> {
+  const { nativeApp } = ctx;
+  ctx.proxyEntries = [];
+
   const rootServices = scanRootServices();
   for (const service of rootServices) {
     const proxyId = nativeApp.createProxy();
-    proxyEntries.push({ proxyId, instance: service.instance, componentName: service.componentName });
+    ctx.proxyEntries.push({ proxyId, instance: service.instance, componentName: service.componentName });
 
     const props = scanProperties(service.instance);
     for (const { name, qp } of props) {
@@ -77,29 +122,37 @@ export async function runApp<T extends QObject>(
     nativeApp.setContextProperty(service.componentName, proxyId);
   }
 
-  // ── Main controller ──
-  const controller = new componentClass();
+  const controller = new ctx.componentClass();
+  ctx.controller = controller;
   const CONTEXT_NAME = "controller";
   const mainProxyId = nativeApp.createProxy();
-  proxyEntries.push({ proxyId: mainProxyId, instance: controller, componentName: CONTEXT_NAME });
+  ctx.proxyEntries.push({ proxyId: mainProxyId, instance: controller, componentName: CONTEXT_NAME });
 
-    const mainProps = scanProperties(controller);
-    logger.info(`[scanProperties] found ${mainProps.length} props on ${controller.constructor.name}`);
-    for (const p of mainProps) {
-      logger.info(`  - ${p.name}: initial=${JSON.stringify(p.qp.value)}`);
+  const mainProps = scanProperties(controller);
+  logger.info(`[scanProperties] found ${mainProps.length} props on ${controller.constructor.name}`);
+  for (const p of mainProps) {
+    logger.info(`  - ${p.name}: initial=${JSON.stringify(p.qp.value)}`);
+    if (ctx.propsSnapshot.has(p.name)) {
+      p.qp.value = ctx.propsSnapshot.get(p.name);
     }
-    for (const { name, qp } of mainProps) {
-      effect(() => {
-        const val = qp.value;
-        logger.debug(`[effect] ${name} = ${JSON.stringify(val)}`);
-        nativeApp.proxySetValue(mainProxyId, name, val);
-      });
-    }
+  }
+  for (const { name, qp } of mainProps) {
+    effect(() => {
+      const val = qp.value;
+      logger.debug(`[effect] ${name} = ${JSON.stringify(val)}`);
+      nativeApp.proxySetValue(mainProxyId, name, val);
+    });
+  }
   nativeApp.setContextProperty(CONTEXT_NAME, mainProxyId);
   logger.info(`[setContextProperty] set ${CONTEXT_NAME} = proxyId ${mainProxyId}`);
 
-  // ── Generate and load QML ──
-  const qmlSource = generateQMLSource(controller, meta, proxyEntries);
+  // Inject brand theme overrides before QML loads
+  if (ctx.options?.theme) {
+    injectThemeOverrides(nativeApp, ctx.options.theme);
+  }
+
+  const newMeta = getQMLComponentMetadata(controller.constructor) || ctx.meta;
+  const qmlSource = generateQMLSource(controller, newMeta, ctx.proxyEntries);
   const qmlWithImports = [
     "import QtQuick",
     "import QtQuick.Controls",
@@ -108,35 +161,107 @@ export async function runApp<T extends QObject>(
     qmlSource,
   ].join("\n");
   logger.info(`[QML generated] ${qmlWithImports.length} bytes, preview: ${qmlWithImports.slice(0, 300).replace(/\n/g, "\\n")}`);
-  nativeApp.loadQML(qmlWithImports, options?.basePath || process.cwd());
+
+  if (typeof nativeApp.reloadQML === "function" && ctx.meta !== newMeta) {
+    nativeApp.reloadQML(qmlWithImports, ctx.options?.basePath || process.cwd());
+    ctx.meta = newMeta;
+  } else {
+    nativeApp.loadQML(qmlWithImports, ctx.options?.basePath || process.cwd());
+  }
+
+  applyDarkTitleBar(nativeApp);
 
   resolveViewChildren(controller);
 
-  options?.onReady?.();
+  ctx.options?.onReady?.();
+}
 
-  // ── Debug Server ──
-  const dt = options?.devtools ?? (process.env.MOCHA_DEVTOOLS ? { autoStart: true } : undefined);
+function startWatchMode(ctx: AppContext): void {
+  const basePath = process.env.MOCHA_ENTRY_DIR || ctx.options?.basePath || process.cwd();
+
+  let srcDir = path.join(basePath, "src");
+  if (!fs.existsSync(srcDir)) {
+    srcDir = basePath;
+  }
+
+  if (!fs.existsSync(srcDir)) {
+    logger.warn(`Watch directory not found: ${srcDir} — watch mode disabled`);
+    return;
+  }
+
+  let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+
+  fs.watch(srcDir, { recursive: true }, async (_event, filename) => {
+    if (!filename || !filename.endsWith(".qml.ts")) return;
+
+    if (reloadTimer) clearTimeout(reloadTimer);
+
+    reloadTimer = setTimeout(async () => {
+      const changedPath = path.resolve(srcDir, filename);
+      logger.info(`[HMR] File changed: ${filename}`);
+
+      const snapshot = captureState(ctx.controller);
+      ctx.propsSnapshot = snapshot;
+
+      try {
+        const ts = Date.now();
+        const newMod = await import(`${changedPath}?t=${ts}`);
+        const NewClass = findComponentClass(newMod);
+
+        if (NewClass && NewClass !== ctx.componentClass) {
+          ctx.componentClass = NewClass;
+          logger.info(`[HMR] New component class: ${NewClass.name}`);
+        }
+
+        await bindControllerToQML(ctx);
+        const elapsed = Date.now() - ts;
+        logger.info(`[HMR] Reloaded in ${elapsed}ms`);
+      } catch (err) {
+        logger.error(`[HMR] Reload failed: ${filename}`, err);
+      }
+    }, 100);
+  });
+
+  logger.info(`[HMR] Watching ${srcDir} for .qml.ts changes...`);
+}
+
+function findComponentClass(mod: any): any | null {
+  for (const key of Object.keys(mod)) {
+    const exported = mod[key];
+    if (typeof exported === "function" && exported.prototype instanceof QObject) {
+      return exported;
+    }
+  }
+  return null;
+}
+
+function captureState(controller: any): Map<string, unknown> {
+  const state = new Map<string, unknown>();
+  if (!controller) return state;
+  for (const key of Object.keys(controller)) {
+    const value = (controller as any)[key];
+    if (value instanceof QProperty) {
+      state.set(key, value.value);
+    }
+  }
+  return state;
+}
+
+async function startDebugServer(ctx: AppContext): Promise<void> {
+  const dt = ctx.options?.devtools ?? (process.env.MOCHA_DEVTOOLS ? { autoStart: true } : undefined);
   if (dt) {
     const dtPort = dt.port ?? parseInt(process.env.MOCHA_DEVTOOLS_PORT ?? "9229", 10);
     const dtHost = dt.host ?? process.env.MOCHA_DEVTOOLS_HOST ?? "localhost";
     _debugServer = new DebugServer({ port: dtPort, host: dtHost });
     if (dt.autoStart ?? true) {
       await _debugServer.start();
-      _debugServer.attach(controller);
+      _debugServer.attach(ctx.controller);
       _debugServer.startConsoleCapture();
-      if (meta?.document?.root) {
-        _debugServer.setQmlTree([meta.document.root]);
+      if (ctx.meta?.document?.root) {
+        _debugServer.setQmlTree([ctx.meta.document.root]);
       }
       logger.info(`Debug server available at http://localhost:${_debugServer.port}`);
     }
-  }
-
-  // ── Event loop: interleave Qt events + Node.js event loop ──
-  await runEventLoop(nativeApp, proxyEntries);
-
-  // Cleanup debug server (frees port)
-  if (_debugServer) {
-    await _debugServer.stop();
   }
 }
 
@@ -150,6 +275,11 @@ function drainPendingCalls(nativeApp: any, entries: ProxyEntry[]): boolean {
         const method = sep >= 0 ? call.slice(0, sep) : call;
         const args = sep >= 0 ? call.slice(sep + 1) : "";
 
+        if (_debugServer && _debugServer.interruptIfBreakpoint(method)) {
+          logger.info(`[debug] Paused at breakpoint: ${method}`);
+          return true;
+        }
+
         if (method.startsWith("_bind_")) {
           const propName = method.slice(6);
           const qp = (entry.instance as any)[propName];
@@ -157,12 +287,6 @@ function drainPendingCalls(nativeApp: any, entries: ProxyEntry[]): boolean {
             qp.value = args ? JSON.parse(args) : "";
           }
           continue;
-        }
-
-        // Check breakpoint BEFORE executing — stop immediately on hit
-        if (_debugServer && _debugServer.interruptIfBreakpoint(method)) {
-          logger.info(`[debug] Paused at breakpoint: ${method}`);
-          return true;
         }
 
         logger.info(`  → ${method}(${args})`);
@@ -220,7 +344,6 @@ function scanProperties(instance: QObject): Array<{ name: string; qp: QProperty 
   const props: Array<{ name: string; qp: QProperty }> = [];
   const visited = new Set<string>();
 
-  // Strategy 1: walk prototype chain looking for __qproperty_ metadata (legacy)
   let proto = Object.getPrototypeOf(instance);
   while (proto && proto !== Object.prototype) {
     for (const key of Object.getOwnPropertyNames(proto)) {
@@ -235,7 +358,6 @@ function scanProperties(instance: QObject): Array<{ name: string; qp: QProperty 
     proto = Object.getPrototypeOf(proto);
   }
 
-  // Strategy 2: scan instance own properties for QProperty instances (works without decorator metadata)
   for (const key of Object.getOwnPropertyNames(instance)) {
     if (visited.has(key)) continue;
     if (key.startsWith("_")) continue;
@@ -272,9 +394,31 @@ function getAllProtoKeys(obj: any): string[] {
   return result;
 }
 
+function applyDarkTitleBar(nativeApp: any): void {
+  try {
+    const dark = nativeApp.getProperty("darkTitleBar");
+    if (dark === "true" || dark === true) {
+      nativeApp.setDarkTitleBar(true);
+      logger.info("[darkTitleBar] Applied dark native title bar");
+    }
+  } catch {
+    // ApplicationWindow may not be the root object — skip silently
+  }
+}
+
+function injectThemeOverrides(nativeApp: any, theme: ThemeLike): void {
+  const overrides = theme.toQMLOverrides();
+  const proxyId = nativeApp.createProxy();
+  for (const [key, value] of Object.entries(overrides)) {
+    nativeApp.proxySetValue(proxyId, key, value);
+  }
+  nativeApp.setContextProperty("_brandTheme", proxyId);
+  logger.info(`[theme] Injected ${Object.keys(overrides).length} brand theme overrides`);
+}
+
 function createMockNativeApp() {
   return {
-    loadQML: () => {}, setProperty: () => {}, getProperty: () => "",
+    loadQML: () => {}, reloadQML: () => 0, setProperty: () => {}, getProperty: () => "",
     createProxy: () => 0, proxySetValue: () => {}, proxyGetValue: () => "",
     proxyDrainPendingCalls: () => [], setContextProperty: () => {},
     processEvents: () => {}, exec: () => 0, quit: () => {},
@@ -284,5 +428,9 @@ function createMockNativeApp() {
     getQmlProperty: () => "",
     getQmlProperties: () => [] as any[],
     setQmlProperty: () => {},
+    findChild: () => 0,
+    getRootObject: () => 0,
+    setDarkTitleBar: () => {},
+    startSystemMove: () => {},
   };
 }
