@@ -285,6 +285,9 @@ function drainPendingCalls(nativeApp: any, entries: ProxyEntry[]): boolean {
           const qp = (entry.instance as any)[propName];
           if (qp instanceof QProperty) {
             qp.value = args ? JSON.parse(args) : "";
+            logger.debug(`[autoBind] ${propName} = ${JSON.stringify(qp.value)}`);
+          } else {
+            logger.warn(`[autoBind] _bind_ target "${propName}" is not a QProperty on ${entry.componentName}`);
           }
           continue;
         }
