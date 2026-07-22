@@ -34,6 +34,7 @@ export function getDebugServer() {
 }
 
 export interface RunAppOptions {
+  mode?: "development" | "production";
   basePath?: string;
   onReady?: () => void;
   devtools?: DevToolsIntegration;
@@ -126,7 +127,8 @@ export async function runApp<T extends QObject>(
     logger.warn(`Debug server failed to start (app will run without debugger): ${(err as any)?.message ?? err}`);
   }
 
-  if (options?.watch || process.env.MOCHA_ENV === "development") {
+  const isProduction = ctx.options?.mode === "production" || process.env.NODE_ENV === "production";
+  if (!isProduction && (options?.watch || process.env.MOCHA_ENV === "development")) {
     startWatchMode(ctx);
   }
 
@@ -208,6 +210,26 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
     qmlSource,
   ].join("\n");
   logger.info(`[QML generated] ${qmlWithImports.length} bytes, preview: ${qmlWithImports.slice(0, 300).replace(/\n/g, "\\n")}`);
+
+  const isProduction = ctx.options?.mode === "production" || process.env.NODE_ENV === "production";
+
+  if (isProduction) {
+    const allImports = [...new Set([
+      "import QtQuick",
+      "import QtQuick.Controls",
+      "import QtQuick.Layouts",
+      ...(newMeta.options.imports || []),
+    ])];
+    const fullQML = [...allImports, "", qmlSource].join("\n");
+    logger.info(`[QML production] ${fullQML.length} bytes, loading directly (no shell)`);
+    nativeApp.loadQML(fullQML, ctx.options?.basePath || process.cwd());
+
+    ctx.meta = newMeta;
+    applyDarkTitleBar(nativeApp);
+    resolveViewChildren(controller);
+    ctx.options?.onReady?.();
+    return;
+  }
 
   const { innerQML: inner, imports: innerImports } = generateInnerQML(qmlSource, newMeta.options.qml);
   const allImports = [...new Set([
