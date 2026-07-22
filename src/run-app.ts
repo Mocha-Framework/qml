@@ -1,5 +1,5 @@
 import { Logger } from "@mocha/shared";
-import { QObject, QProperty, effect, globalContainer, DebugServer } from "@mocha/core";
+import { QObject, QProperty, QComputedProperty, effect, globalContainer, DebugServer } from "@mocha/core";
 import { getQMLComponentMetadata, getAllQMLComponents, generateQMLSource, generateInnerQML, type ProxyEntry } from "./qml-component.js";
 import { setNativeAppRef, createLazyViewChild, type ViewChildRef } from "./view-child.js";
 import * as fs from "node:fs";
@@ -13,6 +13,21 @@ export interface ThemeLike {
 const logger = new Logger("runApp");
 
 let _debugServer: DebugServer | null = null;
+
+let _brandThemeProxyId: number | null = null;
+let _brandThemeNativeApp: any = null;
+
+export function switchTheme(theme: ThemeLike): void {
+  if (!_brandThemeNativeApp || _brandThemeProxyId === null) {
+    logger.warn("[theme] switchTheme called but _brandTheme not initialized");
+    return;
+  }
+  const overrides = theme.toQMLOverrides();
+  for (const [key, value] of Object.entries(overrides)) {
+    _brandThemeNativeApp.proxySetValue(_brandThemeProxyId, key, value);
+  }
+  logger.info(`[theme] switchTheme: updated ${Object.keys(overrides).length} overrides`);
+}
 
 export function getDebugServer() {
   return _debugServer;
@@ -88,6 +103,8 @@ export async function runApp<T extends QObject>(
     nativeApp = createMockNativeApp();
   }
   setNativeAppRef(nativeApp);
+  // Expose for inspection in dev/test scripts
+  (globalThis as any).__mochaNative = nativeApp;
 
   const ctx: AppContext = {
     nativeApp,
@@ -131,10 +148,15 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
 
     const props = scanProperties(service.instance);
     for (const { name, qp } of props) {
-      effect(() => {
-        const val = qp.value;
-        nativeApp.proxySetValue(proxyId, name, val);
-      });
+      if (qp instanceof QComputedProperty) {
+        qp.changed.connect((val: any) => nativeApp.proxySetValue(proxyId, name, val));
+        nativeApp.proxySetValue(proxyId, name, qp.value);
+      } else {
+        effect(() => {
+          const val = qp.value;
+          nativeApp.proxySetValue(proxyId, name, val);
+        });
+      }
     }
     nativeApp.setContextProperty(service.componentName, proxyId);
   }
@@ -148,17 +170,25 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
   const mainProps = scanProperties(controller);
   logger.info(`[scanProperties] found ${mainProps.length} props on ${controller.constructor.name}`);
   for (const p of mainProps) {
-    logger.info(`  - ${p.name}: initial=${JSON.stringify(p.qp.value)}`);
-    if (ctx.propsSnapshot.has(p.name)) {
+    logger.info(`  - ${p.name}: initial=${JSON.stringify(p.qp.value)}${p.qp instanceof QComputedProperty ? " [computed]" : ""}`);
+    if (ctx.propsSnapshot.has(p.name) && !(p.qp instanceof QComputedProperty)) {
       p.qp.value = ctx.propsSnapshot.get(p.name);
     }
   }
   for (const { name, qp } of mainProps) {
-    effect(() => {
-      const val = qp.value;
-      logger.debug(`[effect] ${name} = ${JSON.stringify(val)}`);
-      nativeApp.proxySetValue(mainProxyId, name, val);
-    });
+    if (qp instanceof QComputedProperty) {
+      qp.changed.connect((val: any) => {
+        logger.debug(`[computed] ${name} = ${JSON.stringify(val)}`);
+        nativeApp.proxySetValue(mainProxyId, name, val);
+      });
+      nativeApp.proxySetValue(mainProxyId, name, qp.value);
+    } else {
+      effect(() => {
+        const val = qp.value;
+        logger.debug(`[effect] ${name} = ${JSON.stringify(val)}`);
+        nativeApp.proxySetValue(mainProxyId, name, val);
+      });
+    }
   }
   nativeApp.setContextProperty(CONTEXT_NAME, mainProxyId);
   logger.info(`[setContextProperty] set ${CONTEXT_NAME} = proxyId ${mainProxyId}`);
@@ -413,8 +443,8 @@ function scanRootServices(): Array<{ instance: QObject; componentName: string }>
   return results;
 }
 
-function scanProperties(instance: QObject): Array<{ name: string; qp: QProperty }> {
-  const props: Array<{ name: string; qp: QProperty }> = [];
+function scanProperties(instance: QObject): Array<{ name: string; qp: QProperty | QComputedProperty<any> }> {
+  const props: Array<{ name: string; qp: QProperty | QComputedProperty<any> }> = [];
   const visited = new Set<string>();
 
   let proto = Object.getPrototypeOf(instance);
@@ -427,6 +457,13 @@ function scanProperties(instance: QObject): Array<{ name: string; qp: QProperty 
         const val = (instance as any)[propName];
         if (val instanceof QProperty) props.push({ name: propName, qp: val });
       }
+      if (key.startsWith("__qcomputed_")) {
+        const propName = key.replace("__qcomputed_", "");
+        if (visited.has(propName)) continue;
+        visited.add(propName);
+        const val = (instance as any)[propName];
+        if (val instanceof QComputedProperty) props.push({ name: propName, qp: val });
+      }
     }
     proto = Object.getPrototypeOf(proto);
   }
@@ -435,7 +472,7 @@ function scanProperties(instance: QObject): Array<{ name: string; qp: QProperty 
     if (visited.has(key)) continue;
     if (key.startsWith("_")) continue;
     const val = (instance as any)[key];
-    if (val instanceof QProperty) {
+    if (val instanceof QProperty || val instanceof QComputedProperty) {
       visited.add(key);
       props.push({ name: key, qp: val });
     }
@@ -500,30 +537,6 @@ function injectThemeOverrides(nativeApp: any, theme: ThemeLike): void {
   }
   nativeApp.setContextProperty("_brandTheme", proxyId);
   logger.info(`[theme] Injected ${Object.keys(overrides).length} brand theme overrides`);
-}
-
-let _brandThemeProxyId: number | null = null;
-let _brandThemeNativeApp: any = null;
-
-export function switchTheme(theme: ThemeLike): void {
-  const nativeApp = _brandThemeNativeApp;
-  if (!nativeApp) {
-    logger.warn("[theme] Cannot switch — no native app reference. Call runApp with a theme first.");
-    return;
-  }
-
-  if (_brandThemeProxyId === null) {
-    const proxyId = nativeApp.createProxy();
-    _brandThemeProxyId = proxyId;
-    nativeApp.setContextProperty("_brandTheme", proxyId);
-    logger.info("[theme] Created brand theme proxy for live switching");
-  }
-
-  const overrides = theme.toQMLOverrides();
-  for (const [key, value] of Object.entries(overrides)) {
-    nativeApp.proxySetValue(_brandThemeProxyId, key, value);
-  }
-  logger.info(`[theme] Switched to ${Object.keys(overrides).length} brand theme overrides`);
 }
 
 function createMockNativeApp() {
