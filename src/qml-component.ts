@@ -151,23 +151,54 @@ export function generateQMLSource(
 ): string {
   let qml = metadata.options.qml;
 
-  // Transform controller.xxx bindings via global regex — simple text replacements
-  qml = qml.replace(/controller\.(\w+)\.value\b/g, 'controller.$1');
-  qml = qml.replace(/controller\.(\w+)\s*\(\)/g, 'controller.bridgeCall("$1")');
+  // ── Deprecation: warn if user wrote controller.bridgeCall in their template ──
+  // Non-controller proxies (CounterState, etc.) still need bridgeCall.
+  if (/controller\.bridgeCall\b/.test(qml)) {
+    logger.warn(
+      `[deprecated] controller.bridgeCall found in QML template of ${metadata.componentName}. ` +
+      "Use controller.methodName() directly — the framework routes it internally. " +
+      'Example: controller.echo() instead of controller.bridgeCall("echo").'
+    );
+  }
 
-  // Transform .get("X") calls to direct property access
+  // ── Property access: controller.xxx.value → controller.xxx ──
+  qml = qml.replace(/controller\.(\w+)\.value\b/g, 'controller.$1');
+
+  // ── Method calls: controller.xxx(args) → bridgeCall ──
+  // Excludes bridgeCall itself to avoid double-wrapping existing usage.
+  qml = qml.replace(
+    /controller\.(?!bridgeCall\b)(\w+)\s*\(([^)]*)\)/g,
+    (_match: string, method: string, rawArgs: string) => {
+      const trimmed = rawArgs.trim();
+      if (!trimmed) {
+        return `controller.bridgeCall("${method}")`;
+      }
+      return `controller.bridgeCall(JSON.stringify(["${method}", ${trimmed}]))`;
+    }
+  );
+
+  // ── Transform .get("X") + method() calls for root proxies ──
   if (rootProxies && rootProxies.length > 0) {
     for (const proxy of rootProxies) {
       const name = proxy.componentName;
+      // Property access: Xxx.get("prop") → Xxx.prop
       qml = qml.replace(
         new RegExp(name + '\\.get\\("([^"]*)"\\)', 'g'),
         `${name}.$1`
       );
+      // Method calls: Xxx.method() → Xxx.bridgeCall("method")
+      // Excludes bridgeCall itself to avoid double-wrapping.
+      qml = qml.replace(
+        new RegExp(name + '\\.(?!bridgeCall\\b)(\\w+)\\s*\\(([^)]*)\\)', 'g'),
+        (_m: string, method: string, rawArgs: string) => {
+          const trimmed = rawArgs.trim();
+          if (!trimmed) return `${name}.bridgeCall("${method}")`;
+          return `${name}.bridgeCall(JSON.stringify(["${method}", ${trimmed}]))`;
+        }
+      );
     }
   }
 
-  // NOTE: objectName, autoBind, and router hook injections are now applied
-  // to the inner QML (after Window stripping) in applyInjections().
   return qml;
 }
 
@@ -185,7 +216,8 @@ export function applyInjections(
   // `objectName: "name"` right after the opening { of its element.
   result = injectObjectNamesString(result);
 
-  // Inject router hooks via regex (already AST-free).
+  // Inject router hooks — uses bridgeCall internally.
+  // bridgeCall here is injected code, not user-written, so no deprecation warning.
   const hasLeave = typeof (component as any).routeLeave === "function";
   const hasEnter = typeof (component as any).routeEnter === "function";
   if (hasLeave || hasEnter) {

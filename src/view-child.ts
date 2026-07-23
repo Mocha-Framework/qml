@@ -1,14 +1,9 @@
 import type { QMLNode } from "./widget-wrappers.js";
 
 let _nativeAppRef: any = null;
-let _resolveLog: boolean = true;  // log first few resolve attempts
 
 export function setNativeAppRef(app: any): void {
   _nativeAppRef = app;
-}
-
-export function getNativeAppRef(): any {
-  return _nativeAppRef;
 }
 
 export interface ViewChildRef<T extends QMLNode> {
@@ -45,28 +40,18 @@ class CachedViewChild<T extends QMLNode> {
   resolve(): T | null {
     if (this._resolved && this._wrapper) return this._wrapper;
 
-    if (!_nativeAppRef) {
-      if (_resolveLog) console.warn("[viewChild] no nativeAppRef yet");
-      return null;
-    }
+    if (!_nativeAppRef) return null;
 
     try {
       const handle = _nativeAppRef.findChild(this._ref.selector);
-      if (!handle) {
-        if (_resolveLog) console.warn(`[viewChild] findChild("${this._ref.selector}") = NULL — node not found`);
-        return null;
-      }
+      if (!handle) return null;
 
       const wrapper = new this._ref.wrapperClass();
       wrapper._attach(_nativeAppRef, handle);
       this._wrapper = wrapper;
       this._resolved = true;
 
-      if (_resolveLog) console.log(`[viewChild] findChild("${this._ref.selector}") = ${handle} ✓`);
-
-      // Flush pending sets accumulated before resolution
       if (this._pending.length > 0) {
-        if (_resolveLog) console.log(`[viewChild] flushing ${this._pending.length} pending sets for "${this._ref.selector}"`);
         for (const { prop, value } of this._pending) {
           (wrapper as any)[prop] = value;
         }
@@ -74,8 +59,7 @@ class CachedViewChild<T extends QMLNode> {
       }
 
       return wrapper;
-    } catch (err) {
-      if (_resolveLog) console.error(`[viewChild] resolve("${this._ref.selector}") error:`, err);
+    } catch {
       return null;
     }
   }
