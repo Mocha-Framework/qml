@@ -198,6 +198,61 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
   nativeApp.setContextProperty(CONTEXT_NAME, mainProxyId);
   logger.info(`[setContextProperty] set ${CONTEXT_NAME} = proxyId ${mainProxyId}`);
 
+  // Register MochaForm instances created via this.form({...})
+  const forms: Array<{ instance: any; name: string }> = (controller as any).__mochaForms ?? [];
+  for (const { instance: form, name } of forms) {
+    const formProxyId = nativeApp.createProxy();
+    ctx.proxyEntries.push({ proxyId: formProxyId, instance: form, componentName: name });
+
+    const formProps = [
+      { key: "valid", kind: "qc" as const },
+      { key: "submitting", kind: "qp" as const },
+    ];
+    for (const { key, kind } of formProps) {
+      const prop = (form as any)[key];
+      if (!prop) continue;
+      if (kind === "qc") {
+        (prop as QComputedProperty<any>).changed.connect((val: any) =>
+          nativeApp.proxySetValue(formProxyId, key, val)
+        );
+        nativeApp.proxySetValue(formProxyId, key, (prop as QComputedProperty<any>).value);
+      } else {
+        effect(() => {
+          nativeApp.proxySetValue(formProxyId, key, (prop as QProperty<any>).value);
+        });
+      }
+    }
+
+    // Per-field value QPropertys — sync to proxy AND directly to QML element
+    const fieldNames: string[] = form.fieldNames?.() ?? [];
+    for (const fieldName of fieldNames) {
+      const errProp = form.errorField?.(fieldName) as QProperty<string | null> | undefined;
+      if (errProp) {
+        const errorKey = `error_${fieldName}`;
+        effect(() => {
+          const v = errProp.value;
+          nativeApp.proxySetValue(formProxyId, errorKey, v ?? "");
+        });
+      }
+      const valProp = form.field?.(fieldName) as QProperty<any> | undefined;
+      if (valProp) {
+        const valueKey = `value_${fieldName}`;
+        effect(() => {
+          const v = valProp.value;
+          nativeApp.proxySetValue(formProxyId, valueKey, v);
+          // Directly set the QML TextField text (QQmlPropertyMap bindings are unreliable)
+          const objHandle = nativeApp.findChild(fieldName + "Field");
+          if (objHandle) {
+            nativeApp.setQmlProperty(objHandle, "text", String(v ?? ""));
+          }
+        });
+      }
+    }
+
+    nativeApp.setContextProperty(name, formProxyId);
+    logger.info(`[form] registered "${name}" as context property, proxyId=${formProxyId}`);
+  }
+
   // Inject brand theme overrides before QML loads
   if (ctx.options?.theme) {
     injectThemeOverrides(nativeApp, ctx.options.theme);

@@ -165,17 +165,12 @@ export function generateQMLSource(
   qml = qml.replace(/controller\.(\w+)\.value\b/g, 'controller.$1');
 
   // ── Method calls: controller.xxx(args) → bridgeCall ──
-  // Excludes bridgeCall itself to avoid double-wrapping existing usage.
-  qml = qml.replace(
-    /controller\.(?!bridgeCall\b)(\w+)\s*\(([^)]*)\)/g,
-    (_match: string, method: string, rawArgs: string) => {
-      const trimmed = rawArgs.trim();
-      if (!trimmed) {
-        return `controller.bridgeCall("${method}")`;
-      }
-      return `controller.bridgeCall(JSON.stringify(["${method}", ${trimmed}]))`;
-    }
-  );
+  // Handles nested parens (e.g. controller.foo(a, bar(b), c)) via depth counting.
+  qml = replaceBridgeCalls(qml, "controller", (method, rawArgs) => {
+    const trimmed = rawArgs.trim();
+    if (!trimmed) return `controller.bridgeCall("${method}")`;
+    return `controller.bridgeCall(JSON.stringify(["${method}", ${trimmed}]))`;
+  });
 
   // ── Transform .get("X") + method() calls for root proxies ──
   if (rootProxies && rootProxies.length > 0) {
@@ -187,19 +182,74 @@ export function generateQMLSource(
         `${name}.$1`
       );
       // Method calls: Xxx.method() → Xxx.bridgeCall("method")
-      // Excludes bridgeCall itself to avoid double-wrapping.
-      qml = qml.replace(
-        new RegExp(name + '\\.(?!bridgeCall\\b)(\\w+)\\s*\\(([^)]*)\\)', 'g'),
-        (_m: string, method: string, rawArgs: string) => {
-          const trimmed = rawArgs.trim();
-          if (!trimmed) return `${name}.bridgeCall("${method}")`;
-          return `${name}.bridgeCall(JSON.stringify(["${method}", ${trimmed}]))`;
-        }
-      );
+      qml = replaceBridgeCalls(qml, name, (method, rawArgs) => {
+        const trimmed = rawArgs.trim();
+        if (!trimmed) return `${name}.bridgeCall("${method}")`;
+        return `${name}.bridgeCall(JSON.stringify(["${method}", ${trimmed}]))`;
+      });
     }
   }
 
   return qml;
+}
+
+// ── Helper: depth-aware method call → bridgeCall replacer ──
+
+function replaceBridgeCalls(
+  qml: string,
+  target: string,
+  map: (method: string, rawArgs: string) => string
+): string {
+  let result = "";
+  let i = 0;
+  const prefix = target + ".";
+  const bridgeCallPrefix = target + ".bridgeCall(";
+
+  while (i < qml.length) {
+    const next = qml.indexOf(prefix, i);
+    if (next === -1) { result += qml.slice(i); break; }
+
+    result += qml.slice(i, next);
+    i = next + prefix.length;
+
+    // Skip if it's bridgeCall (already transformed or legacy)
+    if (qml.startsWith("bridgeCall", i)) {
+      result += target + ".bridgeCall";
+      i += "bridgeCall".length;
+      continue;
+    }
+
+    // Read method name: target.METHOD(
+    const methodMatch = /^(\w+)\s*\(/.exec(qml.slice(i));
+    if (!methodMatch) { result += qml.slice(next, i + 1); i = next + prefix.length + 1; continue; }
+
+    const method = methodMatch[1];
+    i += method.length;
+    while (i < qml.length && qml[i] === " ") i++;
+    i++; // skip (
+
+    let depth = 1;
+    const argsStart = i;
+    let inString: string | null = null;
+    while (i < qml.length && depth > 0) {
+      const ch = qml[i];
+      if (inString) {
+        if (ch === "\\") { i += 2; continue; }
+        if (ch === inString) inString = null;
+        i++;
+        continue;
+      }
+      if (ch === '"' || ch === "'") { inString = ch; i++; continue; }
+      if (ch === "(") depth++;
+      else if (ch === ")") depth--;
+      i++;
+    }
+
+    const rawArgs = qml.slice(argsStart, i - 1);
+    result += map(method, rawArgs);
+  }
+
+  return result;
 }
 
 // ── Post-extraction injections (operate on inner QML, no Window wrapper) ──
