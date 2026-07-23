@@ -1,10 +1,29 @@
-import { QObject, QProperty, Signal } from "@mocha/core";
+import { createRequire } from "node:module";
+import { QObject, QProperty } from "@mocha/core";
 import { Logger } from "@mocha/shared";
 import type { QMLComponentMetadata } from "./qml-component.js";
 import { getQMLComponentMetadata, generateQMLSource } from "./qml-component.js";
 import { BindingEngine } from "./binding.js";
 
+const _hrRequire = createRequire(import.meta.url);
+
 const logger = new Logger("HotReload");
+
+/*
+ * ═══════════════════════════════════════════════════════════
+ * DEPRECATED — Use run-app.ts startWatchMode instead.
+ *
+ * The actual hot-reload system lives in:
+ *   packages/qml/src/run-app.ts → startWatchMode() + bindControllerToQML()
+ *
+ * This class was an earlier attempt at stateful HMR with manual
+ * capture/restore. It is no longer wired into the app lifecycle.
+ * The `hotReload: true` option on @QMLComponent is a metadata flag
+ * only — the runtime HMR does NOT use HotReloadManager.
+ *
+ * Kept for backward-compatible exports (public API).
+ * ═══════════════════════════════════════════════════════════
+ */
 
 export interface HotReloadEntry {
   modulePath: string;
@@ -75,7 +94,11 @@ export class HotReloadManager {
     logger.info(`Hot reloading: ${modulePath}`);
 
     try {
-      const newModule = await import(`${modulePath}?t=${Date.now()}`);
+      // Resolve to absolute path and clear CJS cache
+      const resolvedPath = _hrRequire.resolve(modulePath);
+      delete _hrRequire.cache[resolvedPath];
+
+      const newModule = _hrRequire(modulePath);
       const componentClass = this._findComponentClass(newModule);
 
       if (!componentClass) {

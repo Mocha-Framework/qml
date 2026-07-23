@@ -1,9 +1,9 @@
 import { Logger } from "@mocha/shared";
 import { QObject, QProperty, QComputedProperty, effect, globalContainer, DebugServer } from "@mocha/core";
-import { getQMLComponentMetadata, getAllQMLComponents, generateQMLSource, generateInnerQML, type ProxyEntry } from "./qml-component.js";
-import { setNativeAppRef, createLazyViewChild, type ViewChildRef } from "./view-child.js";
-import * as fs from "node:fs";
+import { getQMLComponentMetadata, getAllQMLComponents, generateQMLSource, generateInnerQML, applyInjections, type ProxyEntry } from "./qml-component.js";
+import { setNativeAppRef, createLazyViewChild, invalidateAllViewChildren, type ViewChildRef } from "./view-child.js";
 import * as path from "node:path";
+import * as fs from "node:fs";
 
 // ThemeData interface — duck-typed, avoids composit-build import issues with @mocha/tokens
 export interface ThemeLike {
@@ -38,7 +38,7 @@ export interface RunAppOptions {
   basePath?: string;
   onReady?: () => void;
   devtools?: DevToolsIntegration;
-  fallbackMode?: "warn" | "error" | "silent";
+  fallbackMode?: "warn" | "error" | "silent" | "mock";
   watch?: boolean;
   theme?: ThemeLike;
 }
@@ -87,20 +87,23 @@ export async function runApp<T extends QObject>(
     const { createNativeApp } = await import("@mocha/native");
     nativeApp = await createNativeApp();
   } catch (err) {
-    const fallback = options?.fallbackMode ?? process.env.MOCHA_FALLBACK_MOCK ?? "warn";
-    if (fallback === "error") {
-      throw new Error(
-        "@mocha/native native module not found and MOCHA_FALLBACK_MOCK=error set. " +
-        "Run: cd packages/native && npx napi build --platform --release"
-      );
+    const platform = `${process.platform}-${process.arch}`;
+    const candidate = `mocha-native.${process.platform}-${process.arch}-gnu.node`;
+    const msg = [
+      `[Mocha] Failed to load native bridge (platform: ${platform})`,
+      `  Tried binary: ${candidate}`,
+      `  Error: ${(err as Error)?.message ?? err}`,
+      `  Qt6 required: ensure Qt6 is installed (qmake6 --version to check)`,
+      `  Build: cd packages/bridge-napi && npm run build`,
+      ``,
+      `  Set MOCHA_FALLBACK_MOCK=1 to run with mock backend (no window)`,
+    ].join("\n");
+
+    const useMock = options?.fallbackMode === "mock" || process.env.MOCHA_FALLBACK_MOCK;
+    if (!useMock) {
+      throw new Error(msg);
     }
-    if (fallback !== "silent") {
-      logger.warn(
-        "@mocha/native not available — using mock backend. " +
-        "Properties and QML rendering will be simulated. " +
-        "Set MOCHA_FALLBACK_MOCK=silent to suppress this message or MOCHA_FALLBACK_MOCK=error to fail hard."
-      );
-    }
+    logger.warn(msg + "\n  → Continuing with mock backend (MOCHA_FALLBACK_MOCK=1)");
     nativeApp = createMockNativeApp();
   }
   setNativeAppRef(nativeApp);
@@ -200,7 +203,7 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
     injectThemeOverrides(nativeApp, ctx.options.theme);
   }
 
-  const newMeta = getQMLComponentMetadata(controller.constructor) || ctx.meta;
+  const newMeta = ctx.meta || getQMLComponentMetadata(controller.constructor);
   const qmlSource = generateQMLSource(controller, newMeta, ctx.proxyEntries);
   const qmlWithImports = [
     "import QtQuick",
@@ -232,16 +235,23 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
   }
 
   const { innerQML: inner, imports: innerImports } = generateInnerQML(qmlSource, newMeta.options.qml);
+
+  // Apply objectNames, autoBind, and router hooks on the Window-stripped content.
+  const injectedInner = applyInjections(inner, controller, newMeta);
+
+  // Normalize: strip version numbers from imports (Qt6 is versionless),
+  // deduplicate, and keep only unique base import names.
+  const normalizedInner = innerImports.map((imp: string) => imp.replace(/\s+\d+\.\d+$/, "").trim());
   const allImports = [...new Set([
     "import QtQuick",
     "import QtQuick.Controls",
     "import QtQuick.Layouts",
-    ...innerImports,
-    ...(newMeta.options.imports || []),
+    ...normalizedInner,
+    ...(newMeta.options.imports || []).map((i: string) => i.replace(/\s+\d+\.\d+$/, "").trim()),
   ])];
-  const innerWithImports = [...allImports, "", inner].join("\n");
+  const innerWithImports = [...allImports, "", injectedInner].join("\n");
 
-  logger.info(`[HMR shell] innerQML=${inner.length}b, imports=[${allImports.join(", ")}], shellLoaded=${ctx.shellLoaded}`);
+  logger.info(`[HMR shell] innerQML=${inner.length}b→${injectedInner.length}b, imports=[${allImports.join(", ")}], shellLoaded=${ctx.shellLoaded}`);
   logger.info(`[HMR shell] content preview: ${innerWithImports.slice(0, 500).replace(/\n/g, "\\n")}`);
 
   if (!ctx.shellLoaded) {
@@ -249,9 +259,13 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
     ctx.shellLoaded = true;
     ctx.nativeApp.setShellSource(innerWithImports);
     extractWindowProps(qmlSource, ctx.nativeApp);
+    logger.info("[HMR shell] First load: shell created + content injected");
   } else {
     ctx.nativeApp.setShellSource(innerWithImports);
     extractWindowProps(qmlSource, ctx.nativeApp);
+    // Force all cached viewChild wrappers to re-resolve after QML reload.
+    invalidateAllViewChildren();
+    logger.info("[HMR shell] Reload: content replaced in existing shell, viewChild cache invalidated");
   }
 
   ctx.meta = newMeta;
@@ -288,20 +302,36 @@ function startWatchMode(ctx: AppContext): void {
       logger.info(`[HMR] File changed: ${filename}`);
 
       const snapshot = captureState(ctx.controller);
+      const vcSnapshot = captureViewChildState(ctx.controller);
       ctx.propsSnapshot = snapshot;
 
       try {
-        const ts = Date.now();
-        const newMod = await import(`${changedPath}?t=${ts}`);
-        const NewClass = findComponentClass(newMod);
+        const start = Date.now();
 
-        if (NewClass && NewClass !== ctx.componentClass) {
-          ctx.componentClass = NewClass;
-          logger.info(`[HMR] New component class: ${NewClass.name}`);
+        // Re-read the .qml.ts file and extract the last QML template.
+        // The file may have multiple qml`` templates (e.g. CounterState
+        // has an empty one). We want the last one (AppController).
+        const source = fs.readFileSync(changedPath, "utf-8");
+        const lastQmlIdx = source.lastIndexOf("qml`");
+        if (lastQmlIdx !== -1) {
+          const afterOpen = source.slice(lastQmlIdx + 4); // after `qml\``
+          const closingMatch = afterOpen.match(/`\s*[,\)]/);
+          if (closingMatch && closingMatch.index !== undefined) {
+            ctx.meta.options.qml = afterOpen.slice(0, closingMatch.index);
+            logger.debug(`[HMR] Updated QML template (${ctx.meta.options.qml.length}b)`);
+          } else {
+            logger.warn(`[HMR] Could not find closing backtick in ${filename}`);
+          }
+        } else {
+          logger.warn(`[HMR] Could not extract QML template from ${filename}`);
         }
 
+        // Regenerate QML with the updated template and reload.
         await bindControllerToQML(ctx);
-        const elapsed = Date.now() - ts;
+
+        // Restore viewChild state after QML nodes are recreated.
+        await restoreViewChildState(ctx.controller, vcSnapshot);
+        const elapsed = Date.now() - start;
         logger.info(`[HMR] Reloaded in ${elapsed}ms`);
       } catch (err) {
         logger.error(`[HMR] Reload failed: ${filename}`, err);
@@ -369,6 +399,84 @@ function captureState(controller: any): Map<string, unknown> {
   return state;
 }
 
+// Capture viewChild state before HMR so we can restore it after reload.
+// Reads the current value of each viewChild-backed QML node.
+function captureViewChildState(controller: any): Map<string, any> {
+  const state = new Map<string, any>();
+  if (!controller) return state;
+  const keys = getViewChildKeys(controller);
+  for (const key of keys) {
+    const ref = (controller as any)[key];
+    if (ref && ref.__viewChild) {
+      try {
+        // Read common properties from the live QML node
+        state.set(key, {
+          text: ref.text,
+          checked: ref.checked,
+          value: ref.value,
+        });
+      } catch { /* node already destroyed by HMR */ }
+    }
+  }
+  return state;
+}
+
+// Restore viewChild state after HMR reload.
+// Polls until findChild succeeds (Loader may still be creating nodes).
+async function restoreViewChildState(
+  controller: any,
+  state: Map<string, any>
+): Promise<void> {
+  if (state.size === 0) return;
+
+  const MAX_ATTEMPTS = 30;
+  const POLL_MS = 64;
+
+  for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
+    let unresolved = 0;
+    for (const [key, saved] of state) {
+      const ref = (controller as any)[key];
+      if (!ref || !ref.__viewChild) { unresolved++; continue; }
+
+      try {
+        let applied = false;
+        if (saved.text !== undefined && ref.text !== undefined) { ref.text = saved.text; applied = true; }
+        if (saved.checked !== undefined && ref.checked !== undefined) { ref.checked = saved.checked; applied = true; }
+        if (saved.value !== undefined && ref.value !== undefined) { ref.value = saved.value; applied = true; }
+        if (!applied) { unresolved++; }
+      } catch { unresolved++; }
+    }
+
+    if (unresolved === 0) {
+      logger.debug(`[HMR] viewChild state restored (attempt ${attempt + 1})`);
+      return;
+    }
+
+    await new Promise(r => setTimeout(r, POLL_MS));
+  }
+
+  logger.warn(`[HMR] viewChild state restore timed out after ${MAX_ATTEMPTS} attempts`);
+}
+
+function getViewChildKeys(controller: any): string[] {
+  const keys: string[] = [];
+  let proto = Object.getPrototypeOf(controller);
+  while (proto && proto !== Object.prototype) {
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      const desc = Object.getOwnPropertyDescriptor(proto, key);
+      if (desc && (desc.value as any)?.__viewChild) {
+        keys.push(key);
+      }
+    }
+    proto = Object.getPrototypeOf(proto);
+  }
+  for (const key of Object.getOwnPropertyNames(controller)) {
+    const val = (controller as any)[key];
+    if (val && val.__viewChild) keys.push(key);
+  }
+  return [...new Set(keys)];
+}
+
 async function startDebugServer(ctx: AppContext): Promise<void> {
   const dt = ctx.options?.devtools ?? (process.env.MOCHA_DEVTOOLS ? { autoStart: true } : undefined);
   if (dt) {
@@ -387,15 +495,28 @@ async function startDebugServer(ctx: AppContext): Promise<void> {
   }
 }
 
+function parseBridgeCall(call: string): { method: string; args: unknown[] } {
+  try {
+    const parsed = JSON.parse(call);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      return { method: String(parsed[0]), args: parsed.slice(1) };
+    }
+  } catch {}
+  // Legacy fallback: "method" or "method|argString"
+  const sep = call.indexOf("|");
+  if (sep >= 0) {
+    return { method: call.slice(0, sep), args: [call.slice(sep + 1)] };
+  }
+  return { method: call, args: [] };
+}
+
 function drainPendingCalls(nativeApp: any, entries: ProxyEntry[]): boolean {
   for (const entry of entries) {
     const calls: string[] = nativeApp.proxyDrainPendingCalls(entry.proxyId);
     if (calls && calls.length > 0) {
       logger.info(`[drain] ${entry.componentName}: ${calls.length} calls`);
       for (const call of calls) {
-        const sep = call.indexOf("|");
-        const method = sep >= 0 ? call.slice(0, sep) : call;
-        const args = sep >= 0 ? call.slice(sep + 1) : "";
+        const { method, args } = parseBridgeCall(call);
 
         if (_debugServer && _debugServer.interruptIfBreakpoint(method)) {
           logger.info(`[debug] Paused at breakpoint: ${method}`);
@@ -406,7 +527,7 @@ function drainPendingCalls(nativeApp: any, entries: ProxyEntry[]): boolean {
           const propName = method.slice(6);
           const qp = (entry.instance as any)[propName];
           if (qp instanceof QProperty) {
-            qp.value = args ? JSON.parse(args) : "";
+            qp.value = args.length > 0 ? args[0] : "";
             logger.debug(`[autoBind] ${propName} = ${JSON.stringify(qp.value)}`);
           } else {
             logger.warn(`[autoBind] _bind_ target "${propName}" is not a QProperty on ${entry.componentName}`);
@@ -414,15 +535,11 @@ function drainPendingCalls(nativeApp: any, entries: ProxyEntry[]): boolean {
           continue;
         }
 
-        logger.info(`  → ${method}(${args})`);
+        logger.info(`  → ${method}(${args.map(a => JSON.stringify(a)).join(", ")})`);
 
         const fn = (entry.instance as any)[method];
         if (typeof fn === "function") {
-          if (args) {
-            fn.call(entry.instance, JSON.parse(args));
-          } else {
-            fn.call(entry.instance);
-          }
+          fn.call(entry.instance, ...args);
         }
       }
     }

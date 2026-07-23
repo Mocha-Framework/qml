@@ -2,9 +2,11 @@ import { QObject, QProperty } from "@mocha/core";
 import { Logger } from "@mocha/shared";
 import { QMLTemplateParser, type ParsedQMLDocument, type QMLBindingMap } from "./qml-parser.js";
 import { BindingEngine } from "./binding.js";
+import { QmlAstParser, type QmlDocument } from "./qml-ast-parser.js";
 
 const logger = new Logger("QMLComponent");
 const parser = new QMLTemplateParser();
+const astParser = new QmlAstParser();
 
 export interface QMLComponentOptions {
   qml: string;
@@ -78,33 +80,67 @@ export function generateInnerQML(
     imports.push(match[1].trim());
   }
 
+  // Strip import lines and trim.
   const stripped = qml.replace(/^\s*import\s+.+$/gm, "").trim();
-  const rootMatch = stripped.match(/^\s*(?:Window|ApplicationWindow)\s*\{/);
-  if (!rootMatch) {
+
+  // Deterministic string search: find ApplicationWindow { or Window {
+  // anywhere in the stripped text (not just position 0).
+  let windowTag: string | null = null;
+  const tagMatch = stripped.match(/(ApplicationWindow|Window)\s*\{/);
+  if (tagMatch) {
+    windowTag = tagMatch[1];
+  }
+  const windowIdx = tagMatch ? tagMatch.index! : -1;
+
+  if (windowIdx === -1 || !windowTag) {
+    logger.info("[generateInnerQML] No Window/ApplicationWindow root found, returning full qml");
     return { innerQML: qml, imports };
   }
 
-  const rootOpen = stripped.indexOf("{") + 1;
-  let depth = 1;
-  let i = rootOpen;
-  while (i < stripped.length && depth > 0) {
-    if (stripped[i] === "{") depth++;
-    if (stripped[i] === "}") depth--;
-    i++;
+  // Find the { of the Window block.
+  const braceStart = stripped.indexOf("{", windowIdx);
+  if (braceStart === -1) {
+    logger.info("[generateInnerQML] No opening brace after Window tag");
+    return { innerQML: qml, imports };
   }
 
-  const body = stripped.slice(rootOpen, i - 1);
+  // Count braces to matching }, handling strings/comments.
+  let depth = 1;
+  let pos = braceStart + 1;
+  let inDQ = false, inSQ = false, inLC = false, inBC = false;
+  while (pos < stripped.length && depth > 0) {
+    const ch = stripped[pos];
+    const next = stripped[pos + 1] ?? "";
 
-  const lines = body.split("\n");
-  let startIdx = 0;
-  for (let j = 0; j < lines.length; j++) {
-    const line = lines[j].trim();
-    if (line.match(/^\w+\s*\{/)) {
-      startIdx = j;
+    if (inLC) { if (ch === "\n") inLC = false; pos++; continue; }
+    if (inBC) { if (ch === "*" && next === "/") { inBC = false; pos += 2; } else pos++; continue; }
+    if (inDQ) { if (ch === "\"") inDQ = false; pos++; continue; }
+    if (inSQ) { if (ch === "'") inSQ = false; pos++; continue; }
+
+    if (ch === "/" && next === "/") { inLC = true; pos += 2; continue; }
+    if (ch === "/" && next === "*") { inBC = true; pos += 2; continue; }
+    if (ch === "\"") { inDQ = true; pos++; continue; }
+    if (ch === "'") { inSQ = true; pos++; continue; }
+
+    if (ch === "{") depth++;
+    else if (ch === "}") depth--;
+    pos++;
+  }
+
+  const bodyText = stripped.slice(braceStart + 1, pos - 1);
+
+  // Find first child element line: starts with Uppercase + word + {
+  const bodyLines = bodyText.split("\n");
+  let firstChild = 0;
+  for (let j = 0; j < bodyLines.length; j++) {
+    if (bodyLines[j].trim().match(/^[A-Z]\w*\s*\{/)) {
+      firstChild = j;
       break;
     }
   }
-  const innerQML = lines.slice(startIdx).join("\n").trim();
+
+  const innerQML = bodyLines.slice(firstChild).join("\n").trim();
+  logger.info(`[generateInnerQML] ${windowTag} → inner: ${qml.length}b→${innerQML.length}b (body=${bodyLines.length} lines, child at ${firstChild})`);
   return { innerQML, imports };
 }
 
@@ -115,13 +151,11 @@ export function generateQMLSource(
 ): string {
   let qml = metadata.options.qml;
 
-  // Transform controller.xxx bindings via global regex — robust against parser quirks
+  // Transform controller.xxx bindings via global regex — simple text replacements
   qml = qml.replace(/controller\.(\w+)\.value\b/g, 'controller.$1');
   qml = qml.replace(/controller\.(\w+)\s*\(\)/g, 'controller.bridgeCall("$1")');
 
   // Transform .get("X") calls to direct property access
-  // QQmlPropertyMap exposes dynamic properties with automatic valueChanged signals,
-  // so QML's binding engine tracks them natively — no comma-operator tricks needed.
   if (rootProxies && rootProxies.length > 0) {
     for (const proxy of rootProxies) {
       const name = proxy.componentName;
@@ -132,85 +166,230 @@ export function generateQMLSource(
     }
   }
 
-  // Inject objectName for every id so viewChild/findChild works via C++ bridge
-  {
-    const lines = qml.split("\n");
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const idMatch = line.match(/\bid:\s*"(\w+)"|\bid:\s*(\w+)/);
-      const idName = idMatch?.[1] ?? idMatch?.[2];
-      if (idName && !line.includes("objectName:")) {
-        const indent = (line.match(/^(\s*)/)?.[1] ?? "    ");
-        lines.splice(i + 1, 0, `${indent}objectName: "${idName}"`);
-        i++;
-      }
-    }
-    qml = lines.join("\n");
-  }
+  // NOTE: objectName, autoBind, and router hook injections are now applied
+  // to the inner QML (after Window stripping) in applyInjections().
+  return qml;
+}
 
-  // Auto-inject Router lifecycle hooks if controller has routeLeave/routeEnter
+// ── Post-extraction injections (operate on inner QML, no Window wrapper) ──
+
+export function applyInjections(
+  innerQML: string,
+  component: QObject,
+  metadata: QMLComponentMetadata
+): string {
+  let result = innerQML;
+
+  // Inject objectNames via string scanning (no AST dependency).
+  // Finds every `id: "name"` or `id: name` and injects
+  // `objectName: "name"` right after the opening { of its element.
+  result = injectObjectNamesString(result);
+
+  // Inject router hooks via regex (already AST-free).
   const hasLeave = typeof (component as any).routeLeave === "function";
   const hasEnter = typeof (component as any).routeEnter === "function";
-  if ((hasLeave || hasEnter) && qml.includes("Router")) {
+  if (hasLeave || hasEnter) {
     let hooks = "";
-    if (hasLeave) {
-      hooks += `\n        onRouteLeave: (path) => controller.bridgeCall("routeLeave|" + JSON.stringify(path))`;
-    }
-    if (hasEnter) {
-      hooks += `\n        onRouteEnter: (path) => controller.bridgeCall("routeEnter|" + JSON.stringify(path))`;
-    }
-    qml = qml.replace(/Router\s*\{/, `Router {${hooks}`);
+    if (hasLeave) hooks += `\n        onRouteLeave: (path) => controller.bridgeCall(JSON.stringify(["routeLeave", path]))`;
+    if (hasEnter) hooks += `\n        onRouteEnter: (path) => controller.bridgeCall(JSON.stringify(["routeEnter", path]))`;
+    result = result.replace(/Router\s*\{/, `Router {${hooks}`);
   }
 
-  // AutoBind: scan QML ids matching @qproperty names → inject bridgeCall
+  // Inject autoBind via string scanning (no AST dependency).
   if (metadata.options.autoBind) {
-    const qprops = new Set<string>();
-    let proto = Object.getPrototypeOf(component);
-    while (proto && proto !== Object.prototype) {
-      for (const key of Object.getOwnPropertyNames(proto)) {
-        if (key.startsWith("__qproperty_")) {
-          qprops.add(key.replace("__qproperty_", ""));
-        }
-      }
-      proto = Object.getPrototypeOf(proto);
-    }
-
-    const elementBindings: Record<string, { signal: string; prop: string }> = {
-      TextField: { signal: "onTextChanged", prop: "text" },
-      TextInput: { signal: "onTextEdited", prop: "text" },
-      TextArea: { signal: "onTextChanged", prop: "text" },
-      Checkbox: { signal: "onCheckedChanged", prop: "checked" },
-      Switch: { signal: "onCheckedChanged", prop: "checked" },
-      Slider: { signal: "onValueChanged", prop: "value" },
-      SpinBox: { signal: "onValueChanged", prop: "value" },
-    };
-
-    const lines = qml.split("\n");
-    const elemStack: string[] = [];
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const elemMatch = line.match(/^\s*(\w+)\s*\{/);
-      if (elemMatch) elemStack.push(elemMatch[1]);
-      const closeMatch = line.match(/^\s*\}\s*$/);
-      if (closeMatch && elemStack.length > 0) elemStack.pop();
-
-      const idMatch = line.match(/\bid:\s*"(\w+)"|\bid:\s*(\w+)/);
-      const idName = idMatch?.[1] ?? idMatch?.[2];
-      if (idName && elemStack.length > 0 && qprops.has(idName)) {
-        const elemType = elemStack[elemStack.length - 1];
-        const binding = elementBindings[elemType];
-        if (binding) {
-          const indent = (line.match(/^(\s*)/)?.[1] ?? "    ");
-          const inject = `${indent}${binding.signal}: controller.bridgeCall("_bind_${idName}|" + JSON.stringify(${binding.prop}))`;
-          lines.splice(i + 1, 0, inject);
-          i++;
-        }
-      }
-    }
-    qml = lines.join("\n");
+    result = injectAutoBindString(result, component);
   }
 
-  return qml;
+  return result;
+}
+
+// ── String-based injectors (no AST dependency) ──
+
+function injectObjectNamesString(qml: string): string {
+  // Match id: "name" or id: name
+  const idRe = /\bid\s*:\s*"?(\w+)"?/g;
+  let match;
+  const result = qml.split("\n");
+
+  // Collect all (idName, lineIndex) pairs, process bottom-to-top
+  // so line insertions don't shift earlier ones.
+  const hits: { name: string; line: number }[] = [];
+  for (let i = 0; i < result.length; i++) {
+    const m = idRe.exec(result[i]);
+    if (m) hits.push({ name: m[1], line: i });
+    idRe.lastIndex = 0;
+  }
+
+  // Sort bottom-to-top (highest line first)
+  hits.sort((a, b) => b.line - a.line);
+
+  for (const hit of hits) {
+    // Find the opening { of the element this id belongs to.
+    // Walk backwards from the id line until we find a line
+    // that has a { character.
+    let braceLine = hit.line;
+    while (braceLine >= 0) {
+      if (result[braceLine].includes("{")) break;
+      braceLine--;
+    }
+    if (braceLine < 0) continue;
+
+    const braceLineText = result[braceLine];
+    const indent = braceLineText.match(/^\s*/)?.[0] ?? "    ";
+
+    // Inject objectName right after the line with {
+    result.splice(braceLine + 1, 0, `${indent}  objectName: "${hit.name}"`);
+    hits.forEach(h => { if (h.line >= braceLine + 1) h.line++; });
+  }
+
+  return result.join("\n");
+}
+
+function injectAutoBindString(qml: string, component: QObject): string {
+  // Collect @qproperty names
+  const qprops = new Set<string>();
+  let proto = Object.getPrototypeOf(component);
+  while (proto && proto !== Object.prototype) {
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      if (key.startsWith("__qproperty_")) {
+        qprops.add(key.replace("__qproperty_", ""));
+      }
+    }
+    proto = Object.getPrototypeOf(proto);
+  }
+
+  const elementBindings: Record<string, { signal: string; prop: string }> = {
+    TextField: { signal: "onTextChanged", prop: "text" },
+    TextInput: { signal: "onTextEdited", prop: "text" },
+    TextArea: { signal: "onTextChanged", prop: "text" },
+    Checkbox: { signal: "onCheckedChanged", prop: "checked" },
+    Switch: { signal: "onCheckedChanged", prop: "checked" },
+    Slider: { signal: "onValueChanged", prop: "value" },
+    SpinBox: { signal: "onValueChanged", prop: "value" },
+  };
+
+  const result = qml.split("\n");
+  // Find elements whose id matches a qproperty.
+  // Pattern: TagName { (possibly on same line as id)
+  const idRe = /\bid\s*:\s*"?(\w+)"?/g;
+
+  // Collect bottom-to-top
+  const hits: { name: string; line: number; tag: string }[] = [];
+  for (let i = 0; i < result.length; i++) {
+    const m = idRe.exec(result[i]);
+    if (m && qprops.has(m[1])) {
+      // Find the tag on this line or the line above (where { is)
+      let tagLine = i;
+      while (tagLine >= 0 && !result[tagLine].includes("{")) tagLine--;
+      if (tagLine < 0) continue;
+      const tagMatch = result[tagLine].trim().match(/^(\w+)\s*\{/);
+      if (!tagMatch) continue;
+      const tag = tagMatch[1];
+      const binding = elementBindings[tag];
+      if (!binding) continue;
+      hits.push({ name: m[1], line: tagLine, tag });
+    }
+    idRe.lastIndex = 0;
+  }
+
+  hits.sort((a, b) => b.line - a.line);
+
+  for (const hit of hits) {
+    const indent = result[hit.line].match(/^\s*/)?.[0] ?? "    ";
+    const prop = elementBindings[hit.tag].prop;
+    const signal = elementBindings[hit.tag].signal;
+
+    // Inject two-way binding: property = controller.xxx
+    // This makes the QML property react to controller changes.
+    const bindingLine = `${indent}  ${prop}: controller.${hit.name}`;
+    result.splice(hit.line + 1, 0, bindingLine);
+    hits.forEach(h => { if (h.line >= hit.line + 1) h.line++; });
+
+    // Inject one-way signal: onXxxChanged → bridgeCall
+    // This sends QML property changes to the controller.
+    const signalLine = `${indent}  ${signal}: controller.bridgeCall(JSON.stringify(["_bind_${hit.name}", ${prop}]))`;
+    result.splice(hit.line + 2, 0, signalLine);
+    hits.forEach(h => { if (h.line >= hit.line + 2) h.line++; });
+  }
+
+  return result.join("\n");
+}
+
+function injectObjectNames(qml: string, doc: QmlDocument): string {
+  if (!doc.root) return qml;
+  const elements = astParser.findElements(doc.root, (el) => el.id !== null && el.tag !== "#text");
+  elements.sort((a, b) => b.startLine - a.startLine);
+  let result = qml;
+  for (const el of elements) {
+    if (!el.id) continue;
+    const lineIdx = el.startLine - 1;
+    const lines = result.split("\n");
+    if (lineIdx >= lines.length) continue;
+    const line = lines[lineIdx];
+    if (line.includes("objectName:")) continue;
+    const indent = line.match(/^\s*/)?.[0] ?? "    ";
+    lines.splice(lineIdx + 1, 0, `${indent}  objectName: "${el.id}"`);
+    result = lines.join("\n");
+  }
+  return result;
+}
+
+function injectRouterHooks(qml: string, doc: QmlDocument, hasLeave: boolean, hasEnter: boolean): string {
+  if (!hasLeave && !hasEnter) return qml;
+  const routers = doc.root ? astParser.findElements(doc.root, (el) => el.tag === "Router") : [];
+  if (routers.length === 0) return qml;
+  let hooks = "";
+  if (hasLeave) {
+    hooks += `\n        onRouteLeave: (path) => controller.bridgeCall(JSON.stringify(["routeLeave", path]))`;
+  }
+  if (hasEnter) {
+    hooks += `\n        onRouteEnter: (path) => controller.bridgeCall(JSON.stringify(["routeEnter", path]))`;
+  }
+  return qml.replace(/Router\s*\{/, `Router {${hooks}`);
+}
+
+function injectAutoBind(qml: string, doc: QmlDocument, component: QObject): string {
+  const qprops = new Set<string>();
+  let proto = Object.getPrototypeOf(component);
+  while (proto && proto !== Object.prototype) {
+    for (const key of Object.getOwnPropertyNames(proto)) {
+      if (key.startsWith("__qproperty_")) {
+        qprops.add(key.replace("__qproperty_", ""));
+      }
+    }
+    proto = Object.getPrototypeOf(proto);
+  }
+
+  const elementBindings: Record<string, { signal: string; prop: string }> = {
+    TextField: { signal: "onTextChanged", prop: "text" },
+    TextInput: { signal: "onTextEdited", prop: "text" },
+    TextArea: { signal: "onTextChanged", prop: "text" },
+    Checkbox: { signal: "onCheckedChanged", prop: "checked" },
+    Switch: { signal: "onCheckedChanged", prop: "checked" },
+    Slider: { signal: "onValueChanged", prop: "value" },
+    SpinBox: { signal: "onValueChanged", prop: "value" },
+  };
+
+  if (!doc.root) return qml;
+  const targets = astParser.findElements(doc.root, (el) => el.id !== null && qprops.has(el.id!));
+  targets.sort((a, b) => b.startLine - a.startLine);
+
+  let result = qml;
+  for (const el of targets) {
+    if (!el.id) continue;
+    const binding = elementBindings[el.tag];
+    if (!binding) continue;
+    const lineIdx = el.startLine - 1;
+    const lines = result.split("\n");
+    if (lineIdx >= lines.length) continue;
+    const line = lines[lineIdx];
+    const indent = line.match(/^\s*/)?.[0] ?? "    ";
+    const inject = `${indent}  ${binding.signal}: controller.bridgeCall(JSON.stringify(["_bind_${el.id}", ${binding.prop}]))`;
+    lines.splice(lineIdx + 1, 0, inject);
+    result = lines.join("\n");
+  }
+
+  return result;
 }
 
 export function generateQMLFile(

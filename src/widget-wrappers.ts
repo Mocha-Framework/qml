@@ -8,11 +8,14 @@ export abstract class QMLNode {
   }
 
   getProperty(name: string): string {
-    return this._nativeApp.getObjectProperty(this._handle, name);
+    const val = this._nativeApp.getQmlProperty(this._handle, name) ?? "";
+    console.log(`[QMLNode] getProperty("${name}", handle=${this._handle}) = "${val}"`);
+    return val;
   }
 
   setProperty(name: string, value: unknown): void {
-    this._nativeApp.setObjectProperty(this._handle, name, value);
+    console.log(`[QMLNode] setProperty("${name}", handle=${this._handle}, value="${String(value)}")`);
+    this._nativeApp.setQmlProperty(this._handle, name, String(value));
   }
 
   getIntProperty(name: string): number {
