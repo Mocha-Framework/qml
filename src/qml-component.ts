@@ -3,6 +3,8 @@ import { Logger } from "@mocha/shared";
 import { QMLTemplateParser, type ParsedQMLDocument, type QMLBindingMap } from "./qml-parser.js";
 import { BindingEngine } from "./binding.js";
 import { QmlAstParser, type QmlDocument } from "./qml-ast-parser.js";
+import { analyzeQmlStructure } from "./qml-structure.js";
+import { encodeBridgeCall } from "@mocha/bridge-api";
 
 const logger = new Logger("QMLComponent");
 const parser = new QMLTemplateParser();
@@ -72,76 +74,14 @@ export function generateInnerQML(
   qml: string,
   templateForImports?: string
 ): { innerQML: string; imports: string[] } {
-  const importSource = templateForImports || qml;
-  const imports: string[] = [];
-  const importRegex = /^\s*(import\s+.+)$/gm;
-  let match;
-  while ((match = importRegex.exec(importSource)) !== null) {
-    imports.push(match[1].trim());
-  }
-
-  // Strip import lines and trim.
-  const stripped = qml.replace(/^\s*import\s+.+$/gm, "").trim();
-
-  // Deterministic string search: find ApplicationWindow { or Window {
-  // anywhere in the stripped text (not just position 0).
-  let windowTag: string | null = null;
-  const tagMatch = stripped.match(/(ApplicationWindow|Window)\s*\{/);
-  if (tagMatch) {
-    windowTag = tagMatch[1];
-  }
-  const windowIdx = tagMatch ? tagMatch.index! : -1;
-
-  if (windowIdx === -1 || !windowTag) {
+  const analysis = analyzeQmlStructure(qml, templateForImports);
+  if (!analysis.rootTag || (analysis.rootTag !== "ApplicationWindow" && analysis.rootTag !== "Window")) {
     logger.info("[generateInnerQML] No Window/ApplicationWindow root found, returning full qml");
-    return { innerQML: qml, imports };
+    return { innerQML: analysis.innerQML, imports: analysis.imports };
   }
 
-  // Find the { of the Window block.
-  const braceStart = stripped.indexOf("{", windowIdx);
-  if (braceStart === -1) {
-    logger.info("[generateInnerQML] No opening brace after Window tag");
-    return { innerQML: qml, imports };
-  }
-
-  // Count braces to matching }, handling strings/comments.
-  let depth = 1;
-  let pos = braceStart + 1;
-  let inDQ = false, inSQ = false, inLC = false, inBC = false;
-  while (pos < stripped.length && depth > 0) {
-    const ch = stripped[pos];
-    const next = stripped[pos + 1] ?? "";
-
-    if (inLC) { if (ch === "\n") inLC = false; pos++; continue; }
-    if (inBC) { if (ch === "*" && next === "/") { inBC = false; pos += 2; } else pos++; continue; }
-    if (inDQ) { if (ch === "\"") inDQ = false; pos++; continue; }
-    if (inSQ) { if (ch === "'") inSQ = false; pos++; continue; }
-
-    if (ch === "/" && next === "/") { inLC = true; pos += 2; continue; }
-    if (ch === "/" && next === "*") { inBC = true; pos += 2; continue; }
-    if (ch === "\"") { inDQ = true; pos++; continue; }
-    if (ch === "'") { inSQ = true; pos++; continue; }
-
-    if (ch === "{") depth++;
-    else if (ch === "}") depth--;
-    pos++;
-  }
-
-  const bodyText = stripped.slice(braceStart + 1, pos - 1);
-
-  // Find first child element line: starts with Uppercase + word + {
-  const bodyLines = bodyText.split("\n");
-  let firstChild = 0;
-  for (let j = 0; j < bodyLines.length; j++) {
-    if (bodyLines[j].trim().match(/^[A-Z]\w*\s*\{/)) {
-      firstChild = j;
-      break;
-    }
-  }
-
-  const innerQML = bodyLines.slice(firstChild).join("\n").trim();
-  logger.info(`[generateInnerQML] ${windowTag} → inner: ${qml.length}b→${innerQML.length}b (body=${bodyLines.length} lines, child at ${firstChild})`);
-  return { innerQML, imports };
+  logger.info(`[generateInnerQML] ${analysis.rootTag} → inner: ${qml.length}b→${analysis.innerQML.length}b`);
+  return { innerQML: analysis.innerQML, imports: analysis.imports };
 }
 
 export function generateQMLSource(
@@ -288,43 +228,10 @@ export function applyInjections(
 // ── String-based injectors (no AST dependency) ──
 
 function injectObjectNamesString(qml: string): string {
-  // Match id: "name" or id: name
-  const idRe = /\bid\s*:\s*"?(\w+)"?/g;
-  let match;
-  const result = qml.split("\n");
-
-  // Collect all (idName, lineIndex) pairs, process bottom-to-top
-  // so line insertions don't shift earlier ones.
-  const hits: { name: string; line: number }[] = [];
-  for (let i = 0; i < result.length; i++) {
-    const m = idRe.exec(result[i]);
-    if (m) hits.push({ name: m[1], line: i });
-    idRe.lastIndex = 0;
-  }
-
-  // Sort bottom-to-top (highest line first)
-  hits.sort((a, b) => b.line - a.line);
-
-  for (const hit of hits) {
-    // Find the opening { of the element this id belongs to.
-    // Walk backwards from the id line until we find a line
-    // that has a { character.
-    let braceLine = hit.line;
-    while (braceLine >= 0) {
-      if (result[braceLine].includes("{")) break;
-      braceLine--;
-    }
-    if (braceLine < 0) continue;
-
-    const braceLineText = result[braceLine];
-    const indent = braceLineText.match(/^\s*/)?.[0] ?? "    ";
-
-    // Inject objectName right after the line with {
-    result.splice(braceLine + 1, 0, `${indent}  objectName: "${hit.name}"`);
-    hits.forEach(h => { if (h.line >= braceLine + 1) h.line++; });
-  }
-
-  return result.join("\n");
+  // Match id: "name" or id: name and inject objectName right after it
+  return qml.replace(/\bid\s*:\s*"?(\w+)"?/g, (match, name) => {
+    return `${match}; objectName: "${name}"`;
+  });
 }
 
 function injectAutoBindString(qml: string, component: QObject): string {

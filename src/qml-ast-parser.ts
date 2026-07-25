@@ -5,6 +5,10 @@ export interface QmlElement {
   body: string;
   children: QmlElement[];
   startLine: number;
+  endLine: number;
+  startOffset: number;
+  bodyStartOffset: number;
+  endOffset: number;
 }
 
 export interface QmlDocument {
@@ -13,7 +17,10 @@ export interface QmlDocument {
 }
 
 export class QmlAstParser {
+  private _source = "";
+
   parse(qml: string): QmlDocument {
+    this._source = qml;
     const imports: string[] = [];
     const importRegex = /^\s*import\s+.+$/gm;
     let match;
@@ -21,8 +28,7 @@ export class QmlAstParser {
       imports.push(match[0].trim());
     }
 
-    const stripped = qml.replace(/^\s*import\s+.+$/gm, "").trim();
-    const root = this._parseElement(stripped, 0, (name) => imports.some(i => i.includes(name)));
+    const root = this._parseElement(qml, 0, 0);
     return { imports, root: root?.element ?? null };
   }
 
@@ -49,52 +55,50 @@ export class QmlAstParser {
     }
   }
 
-  private _parseElement(qml: string, startOffset: number, isImport: (name: string) => boolean): { element: QmlElement; endOffset: number } | null {
-    const trimmed = qml.slice(startOffset).trimStart();
-    const offset = startOffset + (qml.length - trimmed.length - startOffset);
+  private _parseElement(
+    qml: string,
+    startOffset: number,
+    baseOffset: number
+  ): { element: QmlElement; endOffset: number } | null {
+    const start = this._findNextElementStart(qml, startOffset);
+    if (!start) return null;
 
-    const tagMatch = trimmed.match(/^([A-Z]\w*)\s*\{/);
-    if (!tagMatch) return null;
-    const tag = tagMatch[1];
-    const bodyStart = offset + tagMatch.index! + tagMatch[0].length;
-
-    const body = this._extractBody(qml, bodyStart);
+    const body = this._extractBody(qml, start.braceOffset + 1);
     if (body === null) return null;
 
-    const element = this._buildElement(tag, body.content, body.endOffset, body.line);
+    const globalStartOffset = baseOffset + start.tagOffset;
+    const globalBodyStartOffset = baseOffset + start.braceOffset + 1;
+    const globalEndOffset = baseOffset + body.endOffset;
+    const element = this._buildElement(
+      start.tag,
+      body.content,
+      this._lineAt(globalStartOffset),
+      this._lineAt(globalEndOffset),
+      globalStartOffset,
+      globalBodyStartOffset,
+      globalEndOffset
+    );
 
     const children: QmlElement[] = [];
-    let searchOffset = bodyStart;
-    while (searchOffset < body.endOffset) {
-      const child = this._parseElement(body.content, searchOffset - bodyStart, isImport);
-      if (child) {
-        children.push(child.element);
-        searchOffset = child.element.startLine >= 0
-          ? bodyStart + (child.endOffset - bodyStart)
-          : body.endOffset;
-      } else {
-        // No element at this position — advance past the current line
-        // to skip property assignments (id:, anchors:, etc.) that
-        // don't start child elements.
-        const remaining = body.content.slice(searchOffset - bodyStart);
-        const nextNewline = remaining.indexOf("\n");
-        if (nextNewline === -1) break;
-        searchOffset += nextNewline + 1;
-      }
+    let searchOffset = 0;
+    while (searchOffset < body.content.length) {
+      const child = this._parseElement(body.content, searchOffset, globalBodyStartOffset);
+      if (!child) break;
+      children.push(child.element);
+      searchOffset = child.endOffset - globalBodyStartOffset;
     }
     element.children = children;
 
-    return { element, endOffset: body.endOffset + 1 };
+    return { element, endOffset: globalEndOffset };
   }
 
-  private _extractBody(qml: string, start: number): { content: string; endOffset: number; line: number } | null {
+  private _extractBody(qml: string, start: number): { content: string; endOffset: number } | null {
     let depth = 1;
     let i = start;
     let inSingleString = false;
     let inDoubleString = false;
     let inLineComment = false;
     let inBlockComment = false;
-    const lineStart = this._lineAt(qml, start);
 
     while (i < qml.length && depth > 0) {
       const ch = qml[i];
@@ -138,11 +142,18 @@ export class QmlAstParser {
     return {
       content: qml.slice(start, endOffset),
       endOffset,
-      line: lineStart,
     };
   }
 
-  private _buildElement(tag: string, body: string, endOffset: number, line: number): QmlElement {
+  private _buildElement(
+    tag: string,
+    body: string,
+    line: number,
+    endLine: number,
+    startOffset: number,
+    bodyStartOffset: number,
+    endOffset: number
+  ): QmlElement {
     const id = this._extractId(body);
     const attrs = this._extractAttrs(body);
     return {
@@ -152,7 +163,107 @@ export class QmlAstParser {
       body,
       children: [],
       startLine: line,
+      endLine,
+      startOffset,
+      bodyStartOffset,
+      endOffset,
     };
+  }
+
+  private _findNextElementStart(
+    qml: string,
+    startOffset: number
+  ): { tag: string; tagOffset: number; braceOffset: number } | null {
+    let i = startOffset;
+    let inSingleString = false;
+    let inDoubleString = false;
+    let inLineComment = false;
+    let inBlockComment = false;
+
+    while (i < qml.length) {
+      const ch = qml[i];
+      const next = qml[i + 1] ?? "";
+
+      if (inLineComment) {
+        if (ch === "\n") inLineComment = false;
+        i++;
+        continue;
+      }
+      if (inBlockComment) {
+        if (ch === "*" && next === "/") {
+          inBlockComment = false;
+          i += 2;
+        } else {
+          i++;
+        }
+        continue;
+      }
+      if (inSingleString) {
+        if (ch === "\\") {
+          i += 2;
+          continue;
+        }
+        if (ch === "'") inSingleString = false;
+        i++;
+        continue;
+      }
+      if (inDoubleString) {
+        if (ch === "\\") {
+          i += 2;
+          continue;
+        }
+        if (ch === '"') inDoubleString = false;
+        i++;
+        continue;
+      }
+
+      if (ch === "/" && next === "/") {
+        inLineComment = true;
+        i += 2;
+        continue;
+      }
+      if (ch === "/" && next === "*") {
+        inBlockComment = true;
+        i += 2;
+        continue;
+      }
+      if (ch === "'") {
+        inSingleString = true;
+        i++;
+        continue;
+      }
+      if (ch === '"') {
+        inDoubleString = true;
+        i++;
+        continue;
+      }
+
+      if (/[A-Z]/.test(ch) && this._isElementBoundary(qml, i)) {
+        let j = i + 1;
+        while (j < qml.length && /\w/.test(qml[j])) j++;
+        const tag = qml.slice(i, j);
+
+        let k = j;
+        while (k < qml.length && /\s/.test(qml[k])) k++;
+        if (qml[k] === "{") {
+          return {
+            tag,
+            tagOffset: i,
+            braceOffset: k,
+          };
+        }
+      }
+
+      i++;
+    }
+
+    return null;
+  }
+
+  private _isElementBoundary(qml: string, offset: number): boolean {
+    if (offset === 0) return true;
+    const prev = qml[offset - 1];
+    return /[\s:{;(,\[]/.test(prev);
   }
 
   private _extractId(body: string): string | null {
@@ -171,7 +282,7 @@ export class QmlAstParser {
     return attrs;
   }
 
-  private _lineAt(qml: string, offset: number): number {
-    return qml.slice(0, offset).split("\n").length;
+  private _lineAt(offset: number): number {
+    return this._source.slice(0, offset).split("\n").length;
   }
 }

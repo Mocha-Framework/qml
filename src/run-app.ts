@@ -1,7 +1,15 @@
 import { Logger } from "@mocha/shared";
-import { QObject, QProperty, QComputedProperty, effect, globalContainer, DebugServer } from "@mocha/core";
-import { getQMLComponentMetadata, getAllQMLComponents, generateQMLSource, generateInnerQML, applyInjections, type ProxyEntry } from "./qml-component.js";
-import { setNativeAppRef, createLazyViewChild, invalidateAllViewChildren, type ViewChildRef } from "./view-child.js";
+import { QObject, QProperty, QComputedProperty, effect, globalContainer, DebugServer, MochaForm } from "@mocha/core";
+import { getQMLComponentMetadata, getAllQMLComponents, generateQMLSource, applyInjections, type ProxyEntry } from "./qml-component.js";
+import {
+  setNativeAppRef,
+  createLazyViewChild,
+  getViewChildStateProps,
+  invalidateAllViewChildren,
+  type ViewChildRef,
+} from "./view-child.js";
+import { analyzeQmlStructure, extractLatestTaggedQmlTemplate, type QmlWindowProps } from "./qml-structure.js";
+import { parseBridgeCall, validateBridgeCall, serializePropertyValue, deserializePropertyValue } from "@mocha/bridge-api";
 import * as path from "node:path";
 import * as fs from "node:fs";
 
@@ -33,6 +41,25 @@ export function getDebugServer() {
   return _debugServer;
 }
 
+export function getCurrentNativeApp(): any | null {
+  return _currentCtx?.nativeApp ?? null;
+}
+
+export function stopApp(): void {
+  if (!_currentCtx) return;
+  _currentCtx.stopRequested = true;
+  try {
+    _currentCtx.cleanupWatchMode?.();
+  } catch (err) {
+    logger.warn(`[HMR] Failed to cleanup watch mode: ${(err as any)?.message ?? err}`);
+  }
+  try {
+    _currentCtx.nativeApp?.quit?.();
+  } catch (err) {
+    logger.warn(`[app] Failed to quit native app: ${(err as any)?.message ?? err}`);
+  }
+}
+
 export interface RunAppOptions {
   mode?: "development" | "production";
   basePath?: string;
@@ -58,6 +85,27 @@ interface AppContext {
   options?: RunAppOptions;
   propsSnapshot: Map<string, unknown>;
   shellLoaded: boolean;
+  lastGoodShellSource: string | null;
+  lastGoodWindowProps: QmlWindowProps | null;
+  lastReloadError: HMRReloadError | null;
+  stopRequested: boolean;
+  cleanupWatchMode?: () => void;
+}
+
+type HMRReloadPhase = "extract" | "generate" | "swap" | "restore";
+
+interface HMRReloadError {
+  phase: HMRReloadPhase;
+  message: string;
+  file?: string;
+  details?: string;
+}
+
+interface CompiledDevelopmentShell {
+  shellSource: string;
+  innerQML: string;
+  imports: string[];
+  windowProps: QmlWindowProps;
 }
 
 let _currentCtx: AppContext | null = null;
@@ -119,8 +167,18 @@ export async function runApp<T extends QObject>(
     options,
     propsSnapshot: new Map(),
     shellLoaded: false,
+    lastGoodShellSource: null,
+    lastGoodWindowProps: null,
+    lastReloadError: null,
+    stopRequested: false,
   };
   _currentCtx = ctx;
+
+  const isDevelopmentWatch = ctx.options?.mode !== "production" &&
+    (options?.watch || process.env.MOCHA_ENV === "development");
+  if (isDevelopmentWatch) {
+    ctx.cleanupWatchMode = startWatchMode(ctx);
+  }
 
   await bindControllerToQML(ctx);
 
@@ -131,11 +189,11 @@ export async function runApp<T extends QObject>(
   }
 
   const isProduction = ctx.options?.mode === "production" || process.env.NODE_ENV === "production";
-  if (!isProduction && (options?.watch || process.env.MOCHA_ENV === "development")) {
-    startWatchMode(ctx);
+  if (!isProduction && !ctx.cleanupWatchMode && (options?.watch || process.env.MOCHA_ENV === "development")) {
+    ctx.cleanupWatchMode = startWatchMode(ctx);
   }
 
-  await runEventLoop(nativeApp, ctx.proxyEntries);
+  await runEventLoop(ctx, nativeApp, ctx.proxyEntries);
 
   if (_debugServer) {
     try { await _debugServer.stop(); } catch {}
@@ -144,9 +202,22 @@ export async function runApp<T extends QObject>(
 
 async function bindControllerToQML(ctx: AppContext): Promise<void> {
   const { nativeApp } = ctx;
+  const rootServices = scanRootServices();
+  const controller = new ctx.componentClass();
+  const newMeta = ctx.meta || getQMLComponentMetadata(controller.constructor);
+  const compileEntries = rootServices.map((service) => ({
+    proxyId: 0,
+    instance: service.instance,
+    componentName: service.componentName,
+  }));
+  const qmlSource = generateQMLSource(controller, newMeta, compileEntries);
+  const isProduction = ctx.options?.mode === "production" || process.env.NODE_ENV === "production";
+  const compiledShell = isProduction
+    ? null
+    : compileDevelopmentShell(qmlSource, controller, newMeta);
+
   ctx.proxyEntries.length = 0;
 
-  const rootServices = scanRootServices();
   for (const service of rootServices) {
     const proxyId = nativeApp.createProxy();
     ctx.proxyEntries.push({ proxyId, instance: service.instance, componentName: service.componentName });
@@ -166,7 +237,6 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
     nativeApp.setContextProperty(service.componentName, proxyId);
   }
 
-  const controller = new ctx.componentClass();
   ctx.controller = controller;
   const CONTEXT_NAME = "controller";
   const mainProxyId = nativeApp.createProxy();
@@ -198,8 +268,14 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
   nativeApp.setContextProperty(CONTEXT_NAME, mainProxyId);
   logger.info(`[setContextProperty] set ${CONTEXT_NAME} = proxyId ${mainProxyId}`);
 
-  // Register MochaForm instances created via this.form({...})
-  const forms: Array<{ instance: any; name: string }> = (controller as any).__mochaForms ?? [];
+  // Register MochaForm instances
+  const forms: Array<{ instance: any; name: string }> = [];
+  for (const key of Object.keys(controller)) {
+    const val = (controller as any)[key];
+    if (val && val instanceof MochaForm) {
+      forms.push({ instance: val, name: key });
+    }
+  }
   for (const { instance: form, name } of forms) {
     const formProxyId = nativeApp.createProxy();
     ctx.proxyEntries.push({ proxyId: formProxyId, instance: form, componentName: name });
@@ -243,7 +319,7 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
           // Directly set the QML TextField text (QQmlPropertyMap bindings are unreliable)
           const objHandle = nativeApp.findChild(fieldName + "Field");
           if (objHandle) {
-            nativeApp.setQmlProperty(objHandle, "text", String(v ?? ""));
+            nativeApp.setQmlProperty(objHandle, "text", v ?? "");
           }
         });
       }
@@ -257,9 +333,6 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
   if (ctx.options?.theme) {
     injectThemeOverrides(nativeApp, ctx.options.theme);
   }
-
-  const newMeta = ctx.meta || getQMLComponentMetadata(controller.constructor);
-  const qmlSource = generateQMLSource(controller, newMeta, ctx.proxyEntries);
   const qmlWithImports = [
     "import QtQuick",
     "import QtQuick.Controls",
@@ -268,8 +341,6 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
     qmlSource,
   ].join("\n");
   logger.info(`[QML generated] ${qmlWithImports.length} bytes, preview: ${qmlWithImports.slice(0, 300).replace(/\n/g, "\\n")}`);
-
-  const isProduction = ctx.options?.mode === "production" || process.env.NODE_ENV === "production";
 
   if (isProduction) {
     const allImports = [...new Set([
@@ -281,6 +352,7 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
     const fullQML = [...allImports, "", qmlSource].join("\n");
     logger.info(`[QML production] ${fullQML.length} bytes, loading directly (no shell)`);
     nativeApp.loadQML(fullQML, ctx.options?.basePath || process.cwd());
+    nativeApp.registerAppObjects?.();
 
     ctx.meta = newMeta;
     applyDarkTitleBar(nativeApp);
@@ -289,39 +361,15 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
     return;
   }
 
-  const { innerQML: inner, imports: innerImports } = generateInnerQML(qmlSource, newMeta.options.qml);
-
-  // Apply objectNames, autoBind, and router hooks on the Window-stripped content.
-  const injectedInner = applyInjections(inner, controller, newMeta);
-
-  // Normalize: strip version numbers from imports (Qt6 is versionless),
-  // deduplicate, and keep only unique base import names.
-  const normalizedInner = innerImports.map((imp: string) => imp.replace(/\s+\d+\.\d+$/, "").trim());
-  const allImports = [...new Set([
-    "import QtQuick",
-    "import QtQuick.Controls",
-    "import QtQuick.Layouts",
-    ...normalizedInner,
-    ...(newMeta.options.imports || []).map((i: string) => i.replace(/\s+\d+\.\d+$/, "").trim()),
-  ])];
-  const innerWithImports = [...allImports, "", injectedInner].join("\n");
-
-  logger.info(`[HMR shell] innerQML=${inner.length}b→${injectedInner.length}b, imports=[${allImports.join(", ")}], shellLoaded=${ctx.shellLoaded}`);
-  logger.info(`[HMR shell] content preview: ${innerWithImports.slice(0, 500).replace(/\n/g, "\\n")}`);
-
   if (!ctx.shellLoaded) {
     ctx.nativeApp.loadShell(ctx.options?.basePath || process.cwd());
     ctx.shellLoaded = true;
-    ctx.nativeApp.setShellSource(innerWithImports);
-    extractWindowProps(qmlSource, ctx.nativeApp);
     logger.info("[HMR shell] First load: shell created + content injected");
-  } else {
-    ctx.nativeApp.setShellSource(innerWithImports);
-    extractWindowProps(qmlSource, ctx.nativeApp);
-    // Force all cached viewChild wrappers to re-resolve after QML reload.
-    invalidateAllViewChildren();
-    logger.info("[HMR shell] Reload: content replaced in existing shell, viewChild cache invalidated");
   }
+
+  applyCompiledShell(ctx, compiledShell!);
+  invalidateAllViewChildren();
+  logger.info("[HMR shell] Shell content applied and viewChild cache invalidated");
 
   ctx.meta = newMeta;
 
@@ -332,7 +380,98 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
   ctx.options?.onReady?.();
 }
 
-function startWatchMode(ctx: AppContext): void {
+function compileDevelopmentShell(
+  qmlSource: string,
+  controller: QObject,
+  metadata: any
+): CompiledDevelopmentShell {
+  const analysis = analyzeQmlStructure(qmlSource, metadata.options.qml);
+
+  const injectedInner = applyInjections(analysis.innerQML, controller, metadata);
+  const normalizedInner = analysis.imports.map((imp: string) => imp.replace(/\s+\d+\.\d+$/, "").trim());
+  const allImports = [...new Set([
+    "import QtQuick",
+    "import QtQuick.Controls",
+    "import QtQuick.Layouts",
+    ...normalizedInner,
+    ...(metadata.options.imports || []).map((i: string) => i.replace(/\s+\d+\.\d+$/, "").trim()),
+  ])];
+  const shellSource = [...allImports, "", injectedInner].join("\n");
+
+  logger.info(`[HMR shell] innerQML=${analysis.innerQML.length}b→${injectedInner.length}b, imports=[${allImports.join(", ")}], shellSource=${shellSource.length}b`);
+  logger.info(`[HMR shell] content preview: ${shellSource.slice(0, 500).replace(/\n/g, "\\n")}`);
+
+  return {
+    shellSource,
+    innerQML: analysis.innerQML,
+    imports: allImports,
+    windowProps: analysis.windowProps,
+  };
+}
+
+function applyCompiledShell(ctx: AppContext, compiled: CompiledDevelopmentShell): void {
+  ctx.nativeApp.setShellSource(compiled.shellSource);
+  applyShellWindowProps(ctx.nativeApp, compiled.windowProps);
+  ctx.nativeApp.registerAppObjects?.();
+  clearShellError(ctx);
+  ctx.lastGoodShellSource = compiled.shellSource;
+  ctx.lastGoodWindowProps = compiled.windowProps;
+  ctx.lastReloadError = null;
+}
+
+function setShellError(ctx: AppContext, error: HMRReloadError): void {
+  ctx.lastReloadError = error;
+  try {
+    ctx.nativeApp.setProperty("hmrExplicitErrorVisible", true);
+    ctx.nativeApp.setProperty("hmrErrorTitle", `HMR ${error.phase} failed`);
+    ctx.nativeApp.setProperty("hmrErrorMessage", error.message);
+    ctx.nativeApp.setProperty("hmrErrorDetails", error.details ?? error.file ?? "");
+  } catch (err) {
+    logger.warn(`[HMR] Failed to surface shell error: ${(err as any)?.message ?? err}`);
+  }
+}
+
+function clearShellError(ctx: AppContext): void {
+  try {
+    ctx.nativeApp.setProperty("hmrExplicitErrorVisible", false);
+    ctx.nativeApp.setProperty("hmrErrorTitle", "");
+    ctx.nativeApp.setProperty("hmrErrorMessage", "");
+    ctx.nativeApp.setProperty("hmrErrorDetails", "");
+  } catch {
+    // Shell may not be loaded yet.
+  }
+}
+
+function applyShellWindowProps(nativeApp: any, props: QmlWindowProps): void {
+  nativeApp.setShellWindowProps({
+    title: props.title,
+    width: props.width,
+    height: props.height,
+  });
+}
+
+function normalizeReloadError(
+  err: unknown,
+  phase: HMRReloadPhase,
+  file?: string
+): HMRReloadError {
+  if (err instanceof Error) {
+    return {
+      phase,
+      file,
+      message: err.message,
+      details: err.stack,
+    };
+  }
+
+  return {
+    phase,
+    file,
+    message: String(err),
+  };
+}
+
+function startWatchMode(ctx: AppContext): () => void {
   const basePath = process.env.MOCHA_ENTRY_DIR || ctx.options?.basePath || process.cwd();
 
   let srcDir = path.join(basePath, "src");
@@ -342,10 +481,11 @@ function startWatchMode(ctx: AppContext): void {
 
   if (!fs.existsSync(srcDir)) {
     logger.warn(`Watch directory not found: ${srcDir} — watch mode disabled`);
-    return;
+    return () => {};
   }
 
   let reloadTimer: ReturnType<typeof setTimeout> | null = null;
+  const cleanupFns: Array<() => void> = [];
 
   const handleFileChange = async (filename: string) => {
     if (!filename || !filename.endsWith(".qml.ts")) return;
@@ -359,36 +499,26 @@ function startWatchMode(ctx: AppContext): void {
       const snapshot = captureState(ctx.controller);
       const vcSnapshot = captureViewChildState(ctx.controller);
       ctx.propsSnapshot = snapshot;
+      const previousTemplate = ctx.meta.options.qml;
+      let phase: HMRReloadPhase = "extract";
 
       try {
         const start = Date.now();
-
-        // Re-read the .qml.ts file and extract the last QML template.
-        // The file may have multiple qml`` templates (e.g. CounterState
-        // has an empty one). We want the last one (AppController).
         const source = fs.readFileSync(changedPath, "utf-8");
-        const lastQmlIdx = source.lastIndexOf("qml`");
-        if (lastQmlIdx !== -1) {
-          const afterOpen = source.slice(lastQmlIdx + 4); // after `qml\``
-          const closingMatch = afterOpen.match(/`\s*[,\)]/);
-          if (closingMatch && closingMatch.index !== undefined) {
-            ctx.meta.options.qml = afterOpen.slice(0, closingMatch.index);
-            logger.debug(`[HMR] Updated QML template (${ctx.meta.options.qml.length}b)`);
-          } else {
-            logger.warn(`[HMR] Could not find closing backtick in ${filename}`);
-          }
-        } else {
-          logger.warn(`[HMR] Could not extract QML template from ${filename}`);
-        }
+        const extracted = extractLatestTaggedQmlTemplate(source);
+        ctx.meta.options.qml = extracted.template;
+        logger.debug(`[HMR] Updated QML template (${ctx.meta.options.qml.length}b)`);
 
-        // Regenerate QML with the updated template and reload.
+        phase = "generate";
         await bindControllerToQML(ctx);
-
-        // Restore viewChild state after QML nodes are recreated.
+        phase = "restore";
         await restoreViewChildState(ctx.controller, vcSnapshot);
         const elapsed = Date.now() - start;
         logger.info(`[HMR] Reloaded in ${elapsed}ms`);
       } catch (err) {
+        ctx.meta.options.qml = previousTemplate;
+        const reloadError = normalizeReloadError(err, phase, filename);
+        setShellError(ctx, reloadError);
         logger.error(`[HMR] Reload failed: ${filename}`, err);
       }
     }, 100);
@@ -401,24 +531,34 @@ function startWatchMode(ctx: AppContext): void {
     });
     watcher.on("error", (err) => {
       logger.warn(`[HMR] fs.watch error: ${(err as any)?.message ?? err} — falling back to polling`);
-      startPollingFallback(srcDir, handleFileChange);
+      cleanupFns.push(startPollingFallback(srcDir, handleFileChange));
     });
+    cleanupFns.push(() => watcher.close());
     logger.info(`[HMR] Watching ${srcDir} for .qml.ts changes (fs.watch)...`);
   } catch (err) {
     logger.warn(`[HMR] fs.watch failed: ${(err as any)?.message ?? err} — using polling`);
-    startPollingFallback(srcDir, handleFileChange);
+    cleanupFns.push(startPollingFallback(srcDir, handleFileChange));
   }
+
+  return () => {
+    if (reloadTimer) clearTimeout(reloadTimer);
+    for (const cleanup of cleanupFns) {
+      try { cleanup(); } catch {}
+    }
+  };
 }
 
-function startPollingFallback(srcDir: string, onChange: (filename: string) => void): void {
+function startPollingFallback(srcDir: string, onChange: (filename: string) => void): () => void {
   // Poll all .qml.ts files in the directory using fs.watchFile (stat-based)
   const files: string[] = [];
+  const fullPaths: string[] = [];
   try {
     for (const entry of fs.readdirSync(srcDir, { recursive: true })) {
       const name = String(entry);
       if (name.endsWith(".qml.ts")) {
         files.push(name);
         const fullPath = path.join(srcDir, name);
+        fullPaths.push(fullPath);
         fs.watchFile(fullPath, { interval: 500 }, (curr, prev) => {
           if (curr.mtimeMs !== prev.mtimeMs) {
             onChange(name);
@@ -430,6 +570,12 @@ function startPollingFallback(srcDir: string, onChange: (filename: string) => vo
   } catch (err) {
     logger.error(`[HMR] Polling setup failed: ${(err as any)?.message ?? err}`);
   }
+
+  return () => {
+    for (const fullPath of fullPaths) {
+      try { fs.unwatchFile(fullPath); } catch {}
+    }
+  };
 }
 
 function findComponentClass(mod: any): any | null {
@@ -463,13 +609,21 @@ function captureViewChildState(controller: any): Map<string, any> {
   for (const key of keys) {
     const ref = (controller as any)[key];
     if (ref && ref.__viewChild) {
+      const stateProps = getViewChildStateProps(ref);
+      if (stateProps.length === 0) continue;
+
       try {
-        // Read common properties from the live QML node
-        state.set(key, {
-          text: ref.text,
-          checked: ref.checked,
-          value: ref.value,
-        });
+        const snapshot: Record<string, unknown> = {};
+        for (const prop of stateProps) {
+          const value = (ref as any)[prop];
+          if (value !== undefined) {
+            snapshot[prop] = value;
+          }
+        }
+
+        if (Object.keys(snapshot).length > 0) {
+          state.set(key, snapshot);
+        }
       } catch { /* node already destroyed by HMR */ }
     }
   }
@@ -494,10 +648,19 @@ async function restoreViewChildState(
       if (!ref || !ref.__viewChild) { unresolved++; continue; }
 
       try {
+        const stateProps = getViewChildStateProps(ref);
+        if (stateProps.length === 0) {
+          unresolved++;
+          continue;
+        }
+
         let applied = false;
-        if (saved.text !== undefined && ref.text !== undefined) { ref.text = saved.text; applied = true; }
-        if (saved.checked !== undefined && ref.checked !== undefined) { ref.checked = saved.checked; applied = true; }
-        if (saved.value !== undefined && ref.value !== undefined) { ref.value = saved.value; applied = true; }
+        for (const prop of stateProps) {
+          if ((saved as Record<string, unknown>)[prop] === undefined) continue;
+          if ((ref as any)[prop] === undefined) continue;
+          (ref as any)[prop] = (saved as Record<string, unknown>)[prop];
+          applied = true;
+        }
         if (!applied) { unresolved++; }
       } catch { unresolved++; }
     }
@@ -550,39 +713,33 @@ async function startDebugServer(ctx: AppContext): Promise<void> {
   }
 }
 
-function parseBridgeCall(call: string): { method: string; args: unknown[] } {
-  try {
-    const parsed = JSON.parse(call);
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      return { method: String(parsed[0]), args: parsed.slice(1) };
-    }
-  } catch {}
-  // Legacy fallback: "method" or "method|argString"
-  const sep = call.indexOf("|");
-  if (sep >= 0) {
-    return { method: call.slice(0, sep), args: [call.slice(sep + 1)] };
-  }
-  return { method: call, args: [] };
-}
-
 function drainPendingCalls(nativeApp: any, entries: ProxyEntry[]): boolean {
   for (const entry of entries) {
     const calls: string[] = nativeApp.proxyDrainPendingCalls(entry.proxyId);
     if (calls && calls.length > 0) {
       logger.info(`[drain] ${entry.componentName}: ${calls.length} calls`);
       for (const call of calls) {
-        const { method, args } = parseBridgeCall(call);
-
-        if (_debugServer && _debugServer.interruptIfBreakpoint(method)) {
-          logger.info(`[debug] Paused at breakpoint: ${method}`);
-          return true;
+        const validation = validateBridgeCall(call);
+        if (!validation.ok) {
+          logger.warn(`[bridge] Invalid bridge call from ${entry.componentName}: ${validation.error}`);
+          continue;
         }
 
-        if (method.startsWith("_bind_")) {
-          const propName = method.slice(6);
+        const bc = validation.call;
+
+        if (_debugServer) {
+          const breakpointName = bc.type === "method" ? bc.method : bc.type === "bind" ? bc.property : bc.hook;
+          if (_debugServer.interruptIfBreakpoint(breakpointName)) {
+            logger.info(`[debug] Paused at breakpoint: ${breakpointName}`);
+            return true;
+          }
+        }
+
+        if (bc.type === "bind") {
+          const propName = bc.property;
           const qp = (entry.instance as any)[propName];
           if (qp instanceof QProperty) {
-            qp.value = args.length > 0 ? args[0] : "";
+            qp.value = bc.value ?? "";
             logger.debug(`[autoBind] ${propName} = ${JSON.stringify(qp.value)}`);
           } else {
             logger.warn(`[autoBind] _bind_ target "${propName}" is not a QProperty on ${entry.componentName}`);
@@ -590,11 +747,19 @@ function drainPendingCalls(nativeApp: any, entries: ProxyEntry[]): boolean {
           continue;
         }
 
-        logger.info(`  → ${method}(${args.map(a => JSON.stringify(a)).join(", ")})`);
+        if (bc.type === "route") {
+          const fn = (entry.instance as any)[bc.hook];
+          if (typeof fn === "function") {
+            fn.call(entry.instance, bc.path);
+          }
+          continue;
+        }
 
-        const fn = (entry.instance as any)[method];
+        logger.info(`  → ${bc.method}(${bc.args.map(a => JSON.stringify(a)).join(", ")})`);
+
+        const fn = (entry.instance as any)[bc.method];
         if (typeof fn === "function") {
-          fn.call(entry.instance, ...args);
+          fn.call(entry.instance, ...bc.args);
         }
       }
     }
@@ -602,18 +767,18 @@ function drainPendingCalls(nativeApp: any, entries: ProxyEntry[]): boolean {
   return false;
 }
 
-function runEventLoop(nativeApp: any, entries: ProxyEntry[]): Promise<void> {
+function runEventLoop(ctx: AppContext, nativeApp: any, entries: ProxyEntry[]): Promise<void> {
   return new Promise((resolve) => {
     let running = true;
 
     const tick = async () => {
-      if (!running) { resolve(); return; }
+      if (!running || ctx.stopRequested) { resolve(); return; }
       try { nativeApp.processEvents(); } catch { running = false; resolve(); return; }
       const breakpointHit = drainPendingCalls(nativeApp, entries);
       if (breakpointHit || (_debugServer && _debugServer.isPaused)) {
         await _debugServer!.waitWhilePaused();
       }
-      if (running) setTimeout(tick, 8);
+      if (running && !ctx.stopRequested) setTimeout(tick, 8);
     };
 
     process.once("SIGINT", () => { running = false; });

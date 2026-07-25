@@ -1,9 +1,13 @@
 export { QMLComponent, getQMLComponentMetadata, getAllQMLComponents, generateQMLSource, generateQMLFile } from "./qml-component.js";
 export type { QMLComponentOptions, QMLComponentMetadata, ProxyEntry } from "./qml-component.js";
-export { runApp, switchTheme } from "./run-app.js";
+export { runApp, switchTheme, stopApp, getCurrentNativeApp } from "./run-app.js";
 export type { RunAppOptions, ThemeLike } from "./run-app.js";
 export { QMLTemplateParser } from "./qml-parser.js";
 export type { ParsedQMLNode, ParsedQMLDocument, QMLBinding, QMLBindingMap } from "./qml-parser.js";
+export { QmlAstParser } from "./qml-ast-parser.js";
+export type { QmlDocument, QmlElement } from "./qml-ast-parser.js";
+export { analyzeQmlStructure, extractLatestTaggedQmlTemplate } from "./qml-structure.js";
+export type { QmlStructureAnalysis, QmlWindowProps } from "./qml-structure.js";
 export { BindingEngine } from "./binding.js";
 export type { BindingExpression } from "./binding.js";
 export { TypeGenerator } from "./generator.js";
@@ -12,6 +16,25 @@ export { hotReload, hotreload, isHotReloadable, HotReloadManager } from "./hot-r
 export type { HotReloadEntry } from "./hot-reload.js";
 export { qml } from "./template-tag.js";
 export * from "./widget-types.js";
-export { viewChild, setNativeAppRef, resolveViewChild } from "./view-child.js";
+export { viewChild, setNativeAppRef, resolveViewChild, getViewChildStateProps } from "./view-child.js";
 export type { ViewChildRef } from "./view-child.js";
-export { QMLNode, QMLTextField, QMLTextInput, QMLButton, QMLCheckBox, QMLSlider, QMLProgressBar } from "./widget-wrappers.js";
+export {
+  QMLNode,
+  QMLTextField,
+  QMLTextInput,
+  QMLButton,
+  QMLCheckBox,
+  QMLSlider,
+  QMLProgressBar,
+  QMLTextArea,
+  QMLSwitch,
+  QMLSpinBox,
+  QMLComboBox,
+  QMLItem,
+  QMLRectangle,
+  QMLText,
+  QMLListView,
+  QMLLoader,
+  getQMLNodeStateProps,
+} from "./widget-wrappers.js";
+export type { QMLNodeClass } from "./widget-wrappers.js";

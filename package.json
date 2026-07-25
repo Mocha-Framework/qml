@@ -13,9 +13,11 @@
   },
   "scripts": {
     "build": "tsc",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run -c vitest.config.ts"
   },
   "dependencies": {
+    "@mocha/bridge-api": "workspace:*",
     "@mocha/core": "workspace:*",
     "@mocha/native": "workspace:*",
     "@mocha/shared": "workspace:*"

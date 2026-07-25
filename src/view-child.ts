@@ -1,4 +1,4 @@
-import type { QMLNode } from "./widget-wrappers.js";
+import { getQMLNodeStateProps, type QMLNode, type QMLNodeClass } from "./widget-wrappers.js";
 
 let _nativeAppRef: any = null;
 
@@ -9,12 +9,12 @@ export function setNativeAppRef(app: any): void {
 export interface ViewChildRef<T extends QMLNode> {
   __viewChild: true;
   selector: string;
-  wrapperClass: new () => T;
+  wrapperClass: QMLNodeClass<T>;
 }
 
 export function viewChild<T extends QMLNode>(
   selector: string,
-  wrapperClass: new () => T
+  wrapperClass: QMLNodeClass<T>
 ): T {
   const ref: ViewChildRef<T> = {
     __viewChild: true,
@@ -22,6 +22,20 @@ export function viewChild<T extends QMLNode>(
     wrapperClass,
   };
   return ref as unknown as T;
+}
+
+export function getViewChildStateProps(value: unknown): readonly string[] {
+  if (!value || typeof value !== "object") return [];
+
+  const maybeRef = value as Partial<ViewChildRef<QMLNode>> & {
+    __viewChildWrapperClass?: QMLNodeClass;
+  };
+
+  if (!maybeRef.__viewChild) return [];
+
+  return getQMLNodeStateProps(
+    maybeRef.wrapperClass ?? maybeRef.__viewChildWrapperClass ?? null
+  );
 }
 
 // ── Resolved ViewChild with cache ──────────────────────────
@@ -89,6 +103,7 @@ class CachedViewChild<T extends QMLNode> {
         if (prop === "__viewChild") return true;
         if (prop === "then") return undefined;
         if (prop === "__vcCache") return self; // expose for HMR invalidate
+        if (prop === "__viewChildWrapperClass") return self._ref.wrapperClass;
 
         const w = self.resolve();
         if (!w) return undefined;
