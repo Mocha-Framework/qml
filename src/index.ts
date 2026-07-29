@@ -1,5 +1,9 @@
-export { QMLComponent, getQMLComponentMetadata, getAllQMLComponents, generateQMLSource, generateQMLFile } from "./qml-component.js";
+export { QMLComponent, getQMLComponentMetadata, getAllQMLComponents, generateQMLSource, generateQMLFile, deriveTagName, getClassByTag, getTagRegistry } from "./qml-component.js";
 export type { QMLComponentOptions, QMLComponentMetadata, ProxyEntry } from "./qml-component.js";
+export { findChildComponentUsages, isChildComponentTag } from "./child-component-walker.js";
+export type { ChildComponentUsage } from "./child-component-walker.js";
+export { bindChildControllers } from "./child-controller-binder.js";
+export type { ChildBindingEntry, ChildBindingResult } from "./child-controller-binder.js";
 export { runApp, switchTheme, stopApp, getCurrentNativeApp } from "./run-app.js";
 export type { RunAppOptions, ThemeLike } from "./run-app.js";
 export { QMLTemplateParser } from "./qml-parser.js";

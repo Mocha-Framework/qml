@@ -16,6 +16,15 @@ export interface QMLComponentOptions {
   autoBind?: boolean;
   hotReload?: boolean;
   providedIn?: "root" | "view";
+  /**
+   * The QML tag name that this component is registered as.
+   *
+   * Allows a parent controller's QML template to use `<Child>` shorthand
+   * to instantiate this controller. If omitted, the tag is derived from
+   * the class name by stripping a trailing `Controller` suffix
+   * (e.g. `ChildController` → `Child`).
+   */
+  as?: string;
 }
 
 export interface QMLComponentMetadata {
@@ -23,10 +32,13 @@ export interface QMLComponentMetadata {
   document: ParsedQMLDocument;
   bindings: QMLBindingMap;
   componentName: string;
+  /** The tag name used in QML templates to instantiate this component. */
+  tagName: string;
   providedIn: "root" | "view";
 }
 
 const componentRegistry = new Map<Function, QMLComponentMetadata>();
+const tagToClass = new Map<string, Function>();
 
 export interface ProxyEntry {
   proxyId: number;
@@ -40,24 +52,40 @@ export function QMLComponent(options: QMLComponentOptions) {
     const document = parser.parse(options.qml);
     const bindings = parser.generateBindings(document, "controller");
 
+    const tagName = options.as ?? deriveTagName(componentName);
+
     const metadata: QMLComponentMetadata = {
       options,
       document,
       bindings,
       componentName,
+      tagName,
       providedIn: options.providedIn || "view",
     };
 
     componentRegistry.set(target, metadata);
-    logger.debug(`Registered QML component: ${componentName}`);
+    tagToClass.set(tagName, target);
+    logger.debug(`Registered QML component: ${componentName} as <${tagName}>`);
 
     (target as any).__qmlComponent = metadata;
     (target as any).__qmlTemplate = options.qml;
     (target as any).__qmlDocument = document;
     (target as any).__qmlBindings = bindings;
+    (target as any).__qmlTag = tagName;
 
     return target;
   };
+}
+
+/**
+ * Derive a tag name from a class name. Strips a trailing `Controller`
+ * suffix if present, e.g. `ChildController` → `Child`.
+ */
+export function deriveTagName(className: string): string {
+  if (className.endsWith("Controller")) {
+    return className.slice(0, -"Controller".length);
+  }
+  return className;
 }
 
 export function getQMLComponentMetadata(
@@ -68,6 +96,21 @@ export function getQMLComponentMetadata(
 
 export function getAllQMLComponents(): Map<Function, QMLComponentMetadata> {
   return new Map(componentRegistry);
+}
+
+/**
+ * Look up a registered controller class by its QML tag name.
+ * Returns `undefined` if no controller is registered for that tag.
+ */
+export function getClassByTag(tag: string): Function | undefined {
+  return tagToClass.get(tag);
+}
+
+/**
+ * Get the full tag → class registry. Used by the child component walker.
+ */
+export function getTagRegistry(): Map<string, Function> {
+  return new Map(tagToClass);
 }
 
 export function generateInnerQML(

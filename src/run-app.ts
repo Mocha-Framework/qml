@@ -1,6 +1,7 @@
 import { Logger } from "@mocha/shared";
 import { QObject, QProperty, QComputedProperty, effect, globalContainer, DebugServer, MochaForm } from "@mocha/core";
 import { getQMLComponentMetadata, getAllQMLComponents, generateQMLSource, applyInjections, type ProxyEntry } from "./qml-component.js";
+import { bindChildControllers } from "./child-controller-binder.js";
 import {
   setNativeAppRef,
   createLazyViewChild,
@@ -268,6 +269,10 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
   nativeApp.setContextProperty(CONTEXT_NAME, mainProxyId);
   logger.info(`[setContextProperty] set ${CONTEXT_NAME} = proxyId ${mainProxyId}`);
 
+  // Bind child controllers referenced via <Child { … }> tags in the QML template.
+  // Runs after the main proxy so child proxies don't interfere with the main one.
+  bindChildControllers(controller, qmlSource, nativeApp, ctx.proxyEntries);
+
   // Register MochaForm instances
   const forms: Array<{ instance: any; name: string }> = [];
   for (const key of Object.keys(controller)) {
@@ -329,10 +334,8 @@ async function bindControllerToQML(ctx: AppContext): Promise<void> {
     logger.info(`[form] registered "${name}" as context property, proxyId=${formProxyId}`);
   }
 
-  // Inject brand theme overrides before QML loads
-  if (ctx.options?.theme) {
-    injectThemeOverrides(nativeApp, ctx.options.theme);
-  }
+  // Always inject _brandTheme before QML loads to prevent ReferenceError
+  injectBrandTheme(nativeApp, ctx.options?.theme);
   const qmlWithImports = [
     "import QtQuick",
     "import QtQuick.Controls",
@@ -802,7 +805,7 @@ function scanRootServices(): Array<{ instance: QObject; componentName: string }>
   return results;
 }
 
-function scanProperties(instance: QObject): Array<{ name: string; qp: QProperty | QComputedProperty<any> }> {
+export function scanProperties(instance: QObject): Array<{ name: string; qp: QProperty | QComputedProperty<any> }> {
   const props: Array<{ name: string; qp: QProperty | QComputedProperty<any> }> = [];
   const visited = new Set<string>();
 
@@ -886,16 +889,20 @@ function applyDarkTitleBar(nativeApp: any): void {
   }
 }
 
-function injectThemeOverrides(nativeApp: any, theme: ThemeLike): void {
-  const overrides = theme.toQMLOverrides();
+function injectBrandTheme(nativeApp: any, theme?: ThemeLike): void {
   const proxyId = nativeApp.createProxy();
   _brandThemeProxyId = proxyId;
   _brandThemeNativeApp = nativeApp;
-  for (const [key, value] of Object.entries(overrides)) {
-    nativeApp.proxySetValue(proxyId, key, value);
+  if (theme) {
+    const overrides = theme.toQMLOverrides();
+    for (const [key, value] of Object.entries(overrides)) {
+      nativeApp.proxySetValue(proxyId, key, value);
+    }
+    logger.info(`[theme] Injected ${Object.keys(overrides).length} brand theme overrides`);
+  } else {
+    logger.info(`[theme] No theme provided, injected empty _brandTheme proxy (Catppuccin defaults)`);
   }
   nativeApp.setContextProperty("_brandTheme", proxyId);
-  logger.info(`[theme] Injected ${Object.keys(overrides).length} brand theme overrides`);
 }
 
 function createMockNativeApp() {
