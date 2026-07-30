@@ -21,9 +21,9 @@
     "test": "vitest run -c vitest.config.ts"
   },
   "dependencies": {
-    "@mocha/bridge-api": "workspace:*",
-    "@mocha/core": "workspace:*",
-    "@mocha/native": "workspace:*",
-    "@mocha/shared": "workspace:*"
+    "@mocha/bridge-api": "^0.1.0",
+    "@mocha/core": "^0.1.0",
+    "@mocha/native": "^0.1.0",
+    "@mocha/shared": "^0.1.0"
   }
 }
