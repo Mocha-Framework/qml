@@ -1,0 +1,9 @@
+{
+  "name": "@mocha-ds/qml",
+  "version": "0.1.0",
+  "description": "Mocha Design System - QML Components (MochaDS)",
+  "type": "module",
+  "scripts": {
+    "test": "qmltestrunner-qt6 -input test/tst_*.qml"
+  }
+}
