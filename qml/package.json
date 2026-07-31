@@ -1,8 +1,30 @@
 {
   "name": "@mocha-ds/qml",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Mocha Design System - QML Components (MochaDS)",
   "type": "module",
+  "main": "MochaDS/qmldir",
+  "files": [
+    "MochaDS",
+    "assets",
+    "README.md"
+  ],
+  "keywords": [
+    "mocha",
+    "mocha-ds",
+    "design-system",
+    "qml",
+    "qt"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Mocha-Framework/qml.git"
+  },
+  "qml": {
+    "importPath": ".",
+    "moduleName": "MochaDS"
+  },
   "scripts": {
     "test": "qmltestrunner-qt6 -input test/tst_*.qml"
   }

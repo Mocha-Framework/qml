@@ -1,0 +1,19 @@
+{
+  "messages": {
+    "greeting": "Hello, {{name}}!",
+    "description": "This is a demonstration of the runtime i18n system.",
+    "buttons": {
+      "save": "Save",
+      "cancel": "Cancel"
+    },
+    "fallback_example": "This is a fallback string",
+    "notifications": {
+      "count": {
+        "zero": "No notifications",
+        "one": "1 notification",
+        "two": "2 notifications!",
+        "other": "{{count}} notifications"
+      }
+    }
+  }
+}

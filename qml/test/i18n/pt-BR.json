@@ -1,0 +1,18 @@
+{
+  "messages": {
+    "greeting": "Olá, {{name}}!",
+    "description": "Esta é uma demonstração do sistema de internacionalização em tempo real.",
+    "buttons": {
+      "save": "Salvar",
+      "cancel": "Cancelar"
+    },
+    "notifications": {
+      "count": {
+        "zero": "Nenhuma notificação",
+        "one": "1 notificação",
+        "two": "2 notificações!",
+        "other": "{{count}} notificações"
+      }
+    }
+  }
+}

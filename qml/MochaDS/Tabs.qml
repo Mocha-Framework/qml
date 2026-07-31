@@ -29,6 +29,12 @@ Item {
 
     property bool sortable: false
 
+    // ── Drag Ghost visual ─────────────────────────
+    property bool dragGhostEnabled: true
+    property real dragGhostScale: 1.04
+    property real dragGhostRotation: 2.5
+    property real dragGhostElevation: 8
+
     // ==========================================
     // Internal Style Tokens & Helpers
     // ==========================================
@@ -304,6 +310,27 @@ Item {
                                 if (active) {
                                     tabItem.held = true;
                                     dragGhost.__startIndex = tabItem._visualIndex;
+                                    dragGhost.__currentIndex = tabItem._visualIndex;
+                                    dragGhost.__sourceLabel = root.getLabel(tabItem._modelData, tabItem._index);
+                                    dragGhost.__sourceIcon = root.getIcon(tabItem._modelData);
+                                    dragGhost.__sourceWidth = tabItem.width;
+                                    dragGhost.__sourceHeight = tabItem.height;
+
+                                    // Reparent ghost to topmost ancestor so it can
+                                    // follow the cursor freely (e.g. across tabs).
+                                    if (root.dragGhostEnabled) {
+                                        var top = root.parent
+                                        while (top && top.parent) top = top.parent
+                                        dragGhost.parent = top
+                                        var pos = tabItem.mapToItem(top, centroid.position.x, centroid.position.y)
+                                        dragGhost.x = pos.x - dragGhost.width / 2
+                                        dragGhost.y = pos.y - dragGhost.height / 2
+                                    } else {
+                                        var pos2 = tabItem.mapToItem(tabRow, centroid.position.x, centroid.position.y)
+                                        dragGhost.x = pos2.x - dragGhost.width / 2
+                                        dragGhost.y = pos2.y - dragGhost.height / 2
+                                    }
+
                                     dragGhost.Drag.active = true;
                                 } else {
                                     tabItem.held = false;
@@ -329,14 +356,21 @@ Item {
                                         // Update the real data array
                                         root.tabsReordered(startIdx, finalIdx);
                                     }
+                                    dragGhost.__sourceLabel = "";
+                                    dragGhost.__sourceIcon = "";
+                                    dragGhost.__sourceWidth = 0;
+                                    dragGhost.__sourceHeight = 0;
+                                    dragGhost.x = 0;
+                                    dragGhost.y = 0;
                                 }
                             }
 
                             onTranslationChanged: {
                                 if (active) {
-                                    var pos = tabItem.mapToItem(tabRow, centroid.position.x, centroid.position.y);
-                                    dragGhost.x = pos.x - dragGhost.width / 2;
-                                    dragGhost.y = pos.y - dragGhost.height / 2;
+                                    var gp = dragGhost.parent
+                                    var pos = tabItem.mapToItem(gp, centroid.position.x, centroid.position.y)
+                                    dragGhost.x = pos.x - dragGhost.width / 2
+                                    dragGhost.y = pos.y - dragGhost.height / 2
                                 }
                             }
                         }
@@ -360,16 +394,97 @@ Item {
                         Item {
                             id: dragGhost
                             parent: tabRow
-                            width: 10
-                            height: 10
-                            
+
                             property int __startIndex: -1
-                            property int __currentIndex: tabItem._visualIndex
-                            
+                            property int __currentIndex: -1
+                            property string __sourceLabel: ""
+                            property string __sourceIcon: ""
+                            property real __sourceWidth: 0
+                            property real __sourceHeight: 0
+
+                            visible: tabItem.held
+                            enabled: false
+                            width: __sourceWidth
+                            height: __sourceHeight
+                            z: 9999
+
                             Drag.keys: root.sortable ? ["mochads-sortable-tab"] : []
+                            Drag.active: tabItem.held
+                            Drag.source: dragGhost
                             Drag.hotSpot.x: width / 2
                             Drag.hotSpot.y: height / 2
-                            Drag.source: dragGhost
+
+                            scale: tabItem.held ? root.dragGhostScale : 1.0
+                            rotation: tabItem.held ? root.dragGhostRotation : 0.0
+                            transformOrigin: Item.Center
+
+                            Behavior on x { NumberAnimation { duration: 50; easing.type: Easing.OutQuad } }
+                            Behavior on y { NumberAnimation { duration: 50; easing.type: Easing.OutQuad } }
+                            Behavior on scale { NumberAnimation { duration: 140; easing.type: Easing.OutBack } }
+                            Behavior on rotation { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+
+                            // Multi-layer shadow for "lifted" feel
+                            Rectangle {
+                                anchors.fill: parent
+                                anchors.margins: -root.dragGhostElevation
+                                radius: Theme.geometry.radiusMd + root.dragGhostElevation
+                                color: "transparent"
+                                visible: tabItem.held
+                                z: -2
+
+                                Rectangle {
+                                    anchors.fill: parent
+                                    radius: parent.radius
+                                    color: Qt.rgba(0, 0, 0, 0.25)
+                                    y: 4
+                                    visible: tabItem.held
+                                }
+                                Rectangle {
+                                    anchors.fill: parent
+                                    anchors.margins: -3
+                                    radius: parent.radius + 3
+                                    color: Qt.rgba(0, 0, 0, 0.12)
+                                    y: 8
+                                    visible: tabItem.held
+                                }
+                            }
+
+                            // Tab visual content (mirrors tabContent in the actual tab)
+                            Item {
+                                anchors.fill: parent
+
+                                // Card variant background
+                                Rectangle {
+                                    visible: root.variant === "card"
+                                    anchors.fill: parent
+                                    color: Theme.colors.base
+                                    border.color: root.finalAccentColor
+                                    border.width: Theme.geometry.borderSm
+                                    radius: Theme.geometry.radiusMd
+                                }
+
+                                Row {
+                                    anchors.centerIn: parent
+                                    spacing: Theme.spacing.sm
+
+                                    LucideIcon {
+                                        name: dragGhost.__sourceIcon
+                                        size: 16
+                                        color: root.finalTextColor
+                                        visible: name !== ""
+                                        anchors.verticalCenter: parent.verticalCenter
+                                    }
+
+                                    Text {
+                                        text: dragGhost.__sourceLabel
+                                        font.family: Theme.typography.familyBold
+                                        font.pixelSize: Theme.typography.sizeMd
+                                        color: root.finalTextColor
+                                        anchors.verticalCenter: parent.verticalCenter
+                                        antialiasing: true
+                                    }
+                                }
+                            }
                         }
                     }
         }

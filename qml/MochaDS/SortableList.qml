@@ -15,6 +15,12 @@ Item {
     property bool sortable: true
     property bool clip: true
 
+    // ── Drag Ghost visual ─────────────────────────
+    property bool dragGhostEnabled: true
+    property real dragGhostScale: 1.04
+    property real dragGhostRotation: 2.5
+    property real dragGhostElevation: 8
+
     signal itemsReordered(int fromIndex, int toIndex)
     signal externalItemDropped(var source, int insertIndex)
 
@@ -87,33 +93,58 @@ Item {
                             root.dragTargetIndex = delegateRoot._index
                             dragGhost.__sourceListId = root.listId
                             dragGhost.__sourceIndex = delegateRoot._index
-                            var pos = delegateRoot.mapToItem(root, centroid.position.x, centroid.position.y)
-                            dragGhost.x = pos.x - dragGhost.width / 2
-                            dragGhost.y = pos.y - dragGhost.height / 2
+                            dragGhost.__sourceModel = delegateRoot._model
+                            dragGhost.__sourceModelData = delegateRoot._modelData
+                            dragGhost.__sourceWidth = delegateRoot.width
+                            dragGhost.__sourceHeight = delegateRoot.height
+
+                            // Reparent ghost to topmost ancestor so it can follow
+                            // the cursor across the whole window (e.g. across columns
+                            // in a Kanban). Drop matching uses Drag.keys, not hierarchy,
+                            // so this is safe.
+                            if (root.dragGhostEnabled) {
+                                var top = root.parent
+                                while (top && top.parent) top = top.parent
+                                dragGhost.parent = top
+                                var pos = delegateRoot.mapToItem(top, centroid.position.x, centroid.position.y)
+                                dragGhost.x = pos.x - dragGhost.width / 2
+                                dragGhost.y = pos.y - dragGhost.height / 2
+                            } else {
+                                var pos2 = delegateRoot.mapToItem(root, centroid.position.x, centroid.position.y)
+                                dragGhost.x = pos2.x - dragGhost.width / 2
+                                dragGhost.y = pos2.y - dragGhost.height / 2
+                            }
                         } else {
                             console.log("DRAG END: from", root.dragIndex, "to", root.dragTargetIndex)
                             var fromIndex = root.dragIndex
                             var toIndex = root.dragTargetIndex
                             delegateRoot.held = false
                             root.isDragging = false
-                            
+
                             var dropResult = dragGhost.Drag.drop()
                             console.log("DROP RESULT:", dropResult)
                             dragGhost.Drag.active = false
-                            
+
                             if (toIndex >= 0 && toIndex !== fromIndex) {
                                 visualModel.items.move(fromIndex, toIndex)
                                 root.itemsReordered(fromIndex, toIndex)
                             }
-                            
+
                             root.dragIndex = -1
                             root.dragTargetIndex = -1
+                            dragGhost.__sourceListId = ""
+                            dragGhost.__sourceIndex = -1
+                            dragGhost.__sourceModel = null
+                            dragGhost.__sourceModelData = null
+                            dragGhost.__sourceWidth = 0
+                            dragGhost.__sourceHeight = 0
                         }
                     }
 
                     onTranslationChanged: {
                         if (active) {
-                            var pos = delegateRoot.mapToItem(root, centroid.position.x, centroid.position.y)
+                            var gp = dragGhost.parent
+                            var pos = delegateRoot.mapToItem(gp, centroid.position.x, centroid.position.y)
                             dragGhost.x = pos.x - dragGhost.width / 2
                             dragGhost.y = pos.y - dragGhost.height / 2
                         }
@@ -184,12 +215,67 @@ Item {
         id: dragGhost
         property string __sourceListId: ""
         property int __sourceIndex: -1
+        property var __sourceModel: null
+        property var __sourceModelData: null
+        property real __sourceWidth: 0
+        property real __sourceHeight: 0
+
         visible: root.isDragging
-        width: 8; height: 8
+        enabled: false
+        width: __sourceWidth
+        height: __sourceHeight
+        z: 9999
+
         Drag.keys: root.sortable ? [root.dragKey] : []
-        Drag.active: false
+        Drag.active: root.isDragging
         Drag.source: dragGhost
         Drag.hotSpot.x: width / 2
         Drag.hotSpot.y: height / 2
+
+        scale: root.isDragging ? root.dragGhostScale : 1.0
+        rotation: root.isDragging ? root.dragGhostRotation : 0.0
+        transformOrigin: Item.Center
+
+        Behavior on x { NumberAnimation { duration: 50; easing.type: Easing.OutQuad } }
+        Behavior on y { NumberAnimation { duration: 50; easing.type: Easing.OutQuad } }
+        Behavior on scale { NumberAnimation { duration: 140; easing.type: Easing.OutBack } }
+        Behavior on rotation { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+
+        // Multi-layer shadow for "lifted" feel (mirrors Draggable.qml pattern)
+        Rectangle {
+            anchors.fill: parent
+            anchors.margins: -root.dragGhostElevation
+            radius: Theme.geometry.radiusMd + root.dragGhostElevation
+            color: "transparent"
+            visible: root.isDragging
+            z: -2
+
+            Rectangle {
+                anchors.fill: parent
+                radius: parent.radius
+                color: Qt.rgba(0, 0, 0, 0.25)
+                y: 4
+                visible: root.isDragging
+            }
+            Rectangle {
+                anchors.fill: parent
+                anchors.margins: -3
+                radius: parent.radius + 3
+                color: Qt.rgba(0, 0, 0, 0.12)
+                y: 8
+                visible: root.isDragging
+            }
+        }
+
+        // Visual clone of the dragged delegate
+        Loader {
+            id: ghostLoader
+            anchors.fill: parent
+            sourceComponent: root.delegate
+
+            property var model: dragGhost.__sourceModel
+            property var modelData: dragGhost.__sourceModelData
+            property int index: dragGhost.__sourceIndex
+        }
     }
 }

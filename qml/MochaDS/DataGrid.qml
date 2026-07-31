@@ -16,6 +16,12 @@ Item {
     readonly property int dragTargetIndex: _dragTargetIndex
     property bool isDragging: false
 
+    // ── Drag Ghost visual ─────────────────────────
+    property bool dragGhostEnabled: true
+    property real dragGhostScale: 1.04
+    property real dragGhostRotation: 2.5
+    property real dragGhostElevation: 8
+
     signal itemsReordered(int fromIndex, int toIndex)
 
     // ── Columns (responsive) ───────────────────────
@@ -179,17 +185,27 @@ Item {
                         root._dragTargetIndex = cellRoot.cellIndex
                         dragGhost.Drag.active = true
                         dragGhost.__sourceIndex = cellRoot.cellIndex
-                        dragGhost.visible = true
+                        dragGhost.__sourceModel = cellRoot.cellData
+                        dragGhost.__sourceWidth = cellRoot.width
+                        dragGhost.__sourceHeight = cellRoot.height
 
-                        var pos = cellRoot.mapToItem(root, centroid.position.x, centroid.position.y)
-                        dragGhost.x = pos.x - dragGhost.width / 2
-                        dragGhost.y = pos.y - dragGhost.height / 2
+                        if (root.dragGhostEnabled) {
+                            var top = root.parent
+                            while (top && top.parent) top = top.parent
+                            dragGhost.parent = top
+                            var pos = cellRoot.mapToItem(top, centroid.position.x, centroid.position.y)
+                            dragGhost.x = pos.x - dragGhost.width / 2
+                            dragGhost.y = pos.y - dragGhost.height / 2
+                        } else {
+                            var pos2 = cellRoot.mapToItem(root, centroid.position.x, centroid.position.y)
+                            dragGhost.x = pos2.x - dragGhost.width / 2
+                            dragGhost.y = pos2.y - dragGhost.height / 2
+                        }
                     } else {
                         cellRoot.held = false
                         var fromIndex = root._dragIndex
                         var targetIdx = root._dragTargetIndex
 
-                        dragGhost.visible = false
                         dragGhost.Drag.drop()
                         dragGhost.Drag.active = false
                         root.isDragging = false
@@ -210,12 +226,17 @@ Item {
 
                         root._dragIndex = -1
                         root._dragTargetIndex = -1
+                        dragGhost.__sourceIndex = -1
+                        dragGhost.__sourceModel = null
+                        dragGhost.__sourceWidth = 0
+                        dragGhost.__sourceHeight = 0
                     }
                 }
 
                 onTranslationChanged: {
                     if (active) {
-                        var pos = cellRoot.mapToItem(root, centroid.position.x, centroid.position.y)
+                        var gp = dragGhost.parent
+                        var pos = cellRoot.mapToItem(gp, centroid.position.x, centroid.position.y)
                         dragGhost.x = pos.x - dragGhost.width / 2
                         dragGhost.y = pos.y - dragGhost.height / 2
                     }
@@ -264,14 +285,67 @@ Item {
     Item {
         id: dragGhost
         property int __sourceIndex: -1
+        property var __sourceModel: null
+        property real __sourceWidth: 0
+        property real __sourceHeight: 0
+
         visible: root.isDragging
-        width: 8; height: 8
+        enabled: false
+        width: __sourceWidth
+        height: __sourceHeight
         z: 9999
+
         Drag.keys: root.sortable ? [root.sortableDragKey] : []
-        Drag.active: false
+        Drag.active: root.isDragging
         Drag.source: dragGhost
         Drag.hotSpot.x: width / 2
-        Drag.hotSpot.y: width / 2
+        Drag.hotSpot.y: height / 2
+
+        scale: root.isDragging ? root.dragGhostScale : 1.0
+        rotation: root.isDragging ? root.dragGhostRotation : 0.0
+        transformOrigin: Item.Center
+
+        Behavior on x { NumberAnimation { duration: 50; easing.type: Easing.OutQuad } }
+        Behavior on y { NumberAnimation { duration: 50; easing.type: Easing.OutQuad } }
+        Behavior on scale { NumberAnimation { duration: 140; easing.type: Easing.OutBack } }
+        Behavior on rotation { NumberAnimation { duration: 140; easing.type: Easing.OutCubic } }
+
+        // Multi-layer shadow for "lifted" feel
+        Rectangle {
+            anchors.fill: parent
+            anchors.margins: -root.dragGhostElevation
+            radius: Theme.geometry.radiusSm + root.dragGhostElevation
+            color: "transparent"
+            visible: root.isDragging
+            z: -2
+
+            Rectangle {
+                anchors.fill: parent
+                radius: parent.radius
+                color: Qt.rgba(0, 0, 0, 0.25)
+                y: 4
+                visible: root.isDragging
+            }
+            Rectangle {
+                anchors.fill: parent
+                anchors.margins: -3
+                radius: parent.radius + 3
+                color: Qt.rgba(0, 0, 0, 0.12)
+                y: 8
+                visible: root.isDragging
+            }
+        }
+
+        // Visual clone of the dragged cell
+        Loader {
+            id: ghostLoader
+            anchors.fill: parent
+            sourceComponent: root.delegate
+
+            property var model: dragGhost.__sourceModel
+            property var modelData: dragGhost.__sourceModel
+            property int index: dragGhost.__sourceIndex
+        }
     }
 
     // ── Scroll ─────────────────────────────────────

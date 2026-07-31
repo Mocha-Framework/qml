@@ -13,7 +13,7 @@ Item {
     height: size * (133.19615 / 116.25877)
 
     function colorize() {
-        var logoPath = Qt.resolvedUrl("assets/logo/mocha-logo.svg").toString();
+        var logoPath = Qt.resolvedUrl("../assets/logo/mocha-logo.svg").toString();
         var svgText = _rawSvgText;
         if (!svgText) {
             var xhr = new XMLHttpRequest();
