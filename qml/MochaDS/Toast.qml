@@ -12,6 +12,13 @@ Item {
     property int duration: 3000  // Auto-dismiss timeout (ms)
     property bool showClose: true
 
+    // ── Mobile gesture opt-ins (see meta/mobile-gestures.md §6.6) ──────
+    // Horizontal swipe to dismiss the toast (alternative to the X button).
+    property bool swipeToDismiss: true
+
+    // Trigger a haptic on appear for warning/error toasts.
+    property bool hapticOnAppear: true
+
     // Signals
     signal dismissed()
 
@@ -202,10 +209,33 @@ Item {
         }
     }
 
+    // ── Mobile: swipe-to-dismiss ──────────────────────────────────────
+    SwipeGesture {
+        anchors.fill: bgRect
+        enabled: root.swipeToDismiss && MediaQuery.isTouchDevice
+        threshold: 40
+        velocityThreshold: 400
+        axis: Qt.Horizontal
+        enabledDirections: ["left", "right"]
+
+        onSwiped: (direction, velocity) => {
+            if (MediaQuery.isTouchDevice) MediaQuery.haptic("impactLight")
+            // Animate bgRect out in the swipe direction, then dismiss.
+            exitAnimX.targetValue = direction === "left" ? -bgRect.width - 40 : bgRect.width + 40
+            root.dismiss()
+        }
+    }
+
     // Visual transitions
     Component.onCompleted: {
         bgRect.x = 120; // slide in from right offset
         entryAnim.start();
+        // Mobile: haptic on appear for warning/error toasts.
+        if (root.hapticOnAppear && MediaQuery.isTouchDevice && root.opacity > 0) {
+            if (root.type === "error")   MediaQuery.haptic("notificationError")
+            else if (root.type === "warning") MediaQuery.haptic("notificationWarning")
+            else if (root.type === "success") MediaQuery.haptic("notificationSuccess")
+        }
     }
 
     ParallelAnimation {
@@ -222,7 +252,7 @@ Item {
 
     ParallelAnimation {
         id: exitAnim
-        NumberAnimation { target: bgRect; property: "x"; to: 350; duration: 220; easing.type: Easing.InCubic }
+        NumberAnimation { id: exitAnimX; target: bgRect; property: "x"; to: 350; duration: 220; easing.type: Easing.InCubic }
         NumberAnimation { target: root; property: "opacity"; to: 0.0; duration: 220 }
         onStopped: {
             root.dismissed(); // notify manager to destroy

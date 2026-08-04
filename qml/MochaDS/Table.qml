@@ -33,6 +33,19 @@ Item {
     // Drag and Drop Reordering
     property bool dragToReorder: false
 
+    // ── Mobile gesture opt-ins (see meta/mobile-gestures.md §6.5) ──────
+    // Long-press a row to expose context (right-click menu replacement).
+    property bool longPressContext: true
+    property int longPressDuration: 500
+
+    // Swipe horizontally across a row to fire a quick action.
+    property bool swipeActions: true
+    property real swipeActionThreshold: 80
+
+    // Pull-to-refresh on the table body. Consumer wires up `onRefreshRequested`.
+    property bool pullToRefresh: false
+    property bool refreshing: false
+
     // ==========================================
     // Signals
     // ==========================================
@@ -42,6 +55,9 @@ Item {
     signal editSelected(var selectedRows)
     signal downloadSelected(var selectedRows)
     signal deleteSelected(var selectedRows)
+    signal rowLongPressed(int index, var modelData, point localPos)
+    signal rowSwipeAction(int index, var modelData, string direction)
+    signal refreshRequested()
 
     // ==========================================
     // Internal computed properties
@@ -426,6 +442,18 @@ Item {
                     clip: true
                     spacing: 0
 
+                    // ── Mobile: pull-to-refresh ──────────────────────────
+                    PullToRefreshGesture {
+                        target: bodyFlickable
+                        enabled: root.pullToRefresh && MediaQuery.isTouchDevice
+                        threshold: 80
+                        refreshing: root.refreshing
+                        onRefresh: {
+                            root.refreshing = true
+                            root.refreshRequested()
+                        }
+                    }
+
                     // Keep header in sync with horizontal scroll
                     onContentXChanged: root.sharedContentX = contentX
                     
@@ -465,6 +493,32 @@ Item {
                             keys: ["table-row"]
 
                             property int visualIndex: DelegateModel.itemsIndex
+
+                            // ── Mobile: long-press for context menu ───────────
+                            LongPressGesture {
+                                anchors.fill: parent
+                                enabled: root.longPressContext && MediaQuery.isTouchDevice
+                                duration: root.longPressDuration
+                                hapticStyle: "impactMedium"
+                                onLongPressed: (localPos) => {
+                                    root.rowLongPressed(dropArea.visualIndex, modelData, localPos)
+                                }
+                            }
+
+                            // ── Mobile: swipe-to-action on rows ────────────────
+                            SwipeGesture {
+                                anchors.fill: parent
+                                enabled: root.swipeActions && MediaQuery.isTouchDevice
+                                threshold: root.swipeActionThreshold
+                                velocityThreshold: 500
+                                axis: Qt.Horizontal
+                                enabledDirections: ["left", "right"]
+                                consumeEvents: false
+                                onSwiped: (direction, velocity) => {
+                                    if (MediaQuery.isTouchDevice) MediaQuery.haptic("impactLight")
+                                    root.rowSwipeAction(dropArea.visualIndex, modelData, direction)
+                                }
+                            }
 
                             onEntered: function(drag) {
                                 var sourceIndex = drag.source.__startIndex;

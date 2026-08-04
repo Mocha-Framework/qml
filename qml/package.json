@@ -1,14 +1,8 @@
 {
-  "name": "@mocha-ds/qml",
-  "version": "0.2.0",
+  "name": "@mocha-framework/ds-qml",
+  "version": "0.2.1-alpha.0",
   "description": "Mocha Design System - QML Components (MochaDS)",
   "type": "module",
-  "main": "MochaDS/qmldir",
-  "files": [
-    "MochaDS",
-    "assets",
-    "README.md"
-  ],
   "keywords": [
     "mocha",
     "mocha-ds",
@@ -27,5 +21,11 @@
   },
   "scripts": {
     "test": "qmltestrunner-qt6 -input test/tst_*.qml"
-  }
+  },
+  "private": false,
+  "files": [
+    "MochaDS/",
+    "assets/",
+    "README.md"
+  ]
 }

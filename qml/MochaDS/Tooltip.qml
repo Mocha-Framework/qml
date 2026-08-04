@@ -11,6 +11,11 @@ Item {
     property var  _origParent: null
     property bool _hovered: false
 
+    // Mobile: tap-to-toggle tooltip. When `true` we treat the first tap as
+    // "show" and a second tap (or outside-tap) as "hide". When `false` we
+    // fall back to the classic hover behavior.
+    readonly property bool __isTouch: MediaQuery.isTouchDevice
+
     on_HoveredChanged: {
         if (_hovered) {
             _delayTimer.restart();
@@ -27,7 +32,12 @@ Item {
         var r = parent;
         while (r.parent) r = r.parent;
 
-        _hoverTrackerComponent.createObject(_origParent);
+        if (root.__isTouch) {
+            // On touch: show on tap, hide on tap-outside.
+            _touchTrackerComponent.createObject(_origParent);
+        } else {
+            _hoverTrackerComponent.createObject(_origParent);
+        }
 
         root.parent = r;
     }
@@ -40,6 +50,28 @@ Item {
             acceptedButtons: Qt.NoButton
             onEntered: root._hovered = true
             onExited:  root._hovered = false
+        }
+    }
+
+    // Mobile variant: tap to show, second tap or outside tap to hide.
+    Component {
+        id: _touchTrackerComponent
+        Item {
+            anchors.fill: parent
+            // Use TapHandler with onToggled-style logic — a TapHandler's
+            // `onTapped` fires on every tap. The visible state is just the
+            // inverse of `_bubble.opacity` to keep things simple.
+            TapHandler {
+                anchors.fill: parent
+                onTapped: {
+                    if (_bubble.opacity < 0.5) {
+                        _delayTimer.restart()
+                    } else {
+                        _bubble.opacity = 0
+                        _bubble.scale = 0.96
+                    }
+                }
+            }
         }
     }
 

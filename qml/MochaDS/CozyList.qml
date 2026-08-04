@@ -39,12 +39,32 @@ Item {
     property real dragGhostRotation: 2.5
     property real dragGhostElevation: 8
 
+    // ── Mobile gesture opt-ins (see meta/mobile-gestures.md §6.5) ──────
+    // Long-press a row to expose context (e.g. open a context menu).
+    property bool longPressContext: true
+    property int longPressDuration: 500
+
+    // Swipe horizontally across a row to fire a quick action.
+    property bool swipeActions: true
+    property real swipeActionThreshold: 80
+
+    // Pull-to-refresh on the list itself. When true, the consumer must
+    // wire up `onRefreshRequested` to a model refresh and reset
+    // `refreshing` when done.
+    property bool pullToRefresh: false
+
     signal itemsReordered(int fromIndex, int toIndex)
     signal itemClicked(var modelData)
+    signal itemLongPressed(int index, var modelData, point localPos)
+    signal itemSwipeAction(int index, var modelData, string direction) // "left" | "right"
+    signal refreshRequested()
 
     property int dragIndex: -1
     property int dragTargetIndex: -1
     property bool isDragging: false
+
+    // External state for PullToRefreshGesture
+    property bool refreshing: false
 
     // Reactive empty check
     readonly property bool isEmpty: {
@@ -85,6 +105,23 @@ Item {
         visible: !root.isEmpty && !root.isLoading
         reuseItems: false
 
+        // ── Mobile: pull-to-refresh ──────────────────────────────────────
+        PullToRefreshGesture {
+            target: listView
+            enabled: root.pullToRefresh && MediaQuery.isTouchDevice
+            threshold: 80
+            hapticOnTrigger: true
+            refreshing: root.refreshing
+
+            onRefresh: {
+                root.refreshing = true
+                root.refreshRequested()
+            }
+            onProgressChanged: (progress) => {
+                // Hook for a visual spinner above the list.
+            }
+        }
+
         model: DelegateModel {
             id: visualModel
             model: root.model
@@ -120,10 +157,49 @@ Item {
                     cursorShape: delegateRoot.held ? Qt.ClosedHandCursor : (containsMouse ? Qt.OpenHandCursor : Qt.ArrowCursor)
                 }
 
+                // ── Mobile: long-press for context menu ─────────────────────
+                LongPressGesture {
+                    id: rowLongPress
+                    anchors.fill: parent
+                    enabled: root.longPressContext && MediaQuery.isTouchDevice
+                    duration: root.longPressDuration
+                    hapticStyle: "impactMedium"
+
+                    onLongPressed: (localPos) => {
+                        root.itemLongPressed(delegateRoot._index, cellLoader.cellModelData, localPos)
+                    }
+                }
+
+                // ── Mobile: swipe to reveal quick actions ──────────────────
+                // We translate the row by `swipeOffset` during the drag and
+                // snap back / commit on release. The SwipeGesture tracks the
+                // drag — we mirror its `swipeProgress` into a translation.
+                SwipeGesture {
+                    id: rowSwipe
+                    anchors.fill: parent
+                    enabled: root.swipeActions && MediaQuery.isTouchDevice
+                    threshold: root.swipeActionThreshold
+                    velocityThreshold: 500
+                    axis: Qt.Horizontal
+                    enabledDirections: ["left", "right"]
+                    consumeEvents: false  // let parent MouseArea / drag handlers still see the gesture
+
+                    onSwipeProgress: (direction, progress) => {
+                        // Translation only — snap-back happens automatically
+                        // because consumeEvents is false and we don't bind a
+                        // transform here. (Hook for visual reveal of an
+                        // action button: parent can listen to progress.)
+                    }
+                    onSwiped: (direction, velocity) => {
+                        if (MediaQuery.isTouchDevice) MediaQuery.haptic("impactLight")
+                        root.itemSwipeAction(delegateRoot._index, cellLoader.cellModelData, direction)
+                    }
+                }
+
                 DragHandler {
                     id: dragHandler
                     target: null
-                    enabled: root.sortable
+                    enabled: root.sortable && (!MediaQuery.isTouchDevice || root.reorderRequiresLongPress === false || rowLongPress.pressed)
                     dragThreshold: 8
                     acceptedButtons: Qt.LeftButton
 

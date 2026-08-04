@@ -21,12 +21,23 @@ Item {
     property real dragGhostRotation: 2.5
     property real dragGhostElevation: 8
 
+    // ── Mobile gesture opt-ins (see meta/mobile-gestures.md §6.5) ──────
+    // Long-press a row to expose context (e.g. open a context menu).
+    property bool longPressContext: true
+    property int longPressDuration: 500
+
+    // Pull-to-refresh on the list itself.
+    property bool pullToRefresh: false
+
     signal itemsReordered(int fromIndex, int toIndex)
     signal externalItemDropped(var source, int insertIndex)
+    signal itemLongPressed(int index, var modelData, point localPos)
+    signal refreshRequested()
 
     property int dragIndex: -1
     property int dragTargetIndex: -1
     property bool isDragging: false
+    property bool refreshing: false
 
     implicitWidth: 300
     implicitHeight: 400
@@ -42,6 +53,18 @@ Item {
         anchors.bottomMargin: root.paddingBottom
         clip: root.clip
         spacing: root.spacing
+
+        // ── Mobile: pull-to-refresh ──────────────────────────────────
+        PullToRefreshGesture {
+            target: listView
+            enabled: root.pullToRefresh && MediaQuery.isTouchDevice
+            threshold: 80
+            refreshing: root.refreshing
+            onRefresh: {
+                root.refreshing = true
+                root.refreshRequested()
+            }
+        }
         reuseItems: false
         cacheBuffer: 0
 
@@ -75,10 +98,24 @@ Item {
                     NumberAnimation { duration: 250; easing.type: Easing.OutCubic }
                 }
 
+                // ── Mobile: long-press to prime drag-to-reorder ──────────────────
+                LongPressGesture {
+                    id: rowLongPress
+                    anchors.fill: parent
+                    enabled: root.longPressContext && MediaQuery.isTouchDevice
+                    duration: root.longPressDuration
+                    hapticStyle: "impactMedium"
+
+                    onLongPressed: (localPos) => {
+                        root.itemLongPressed(delegateRoot._index, delegateRoot._modelData, localPos)
+                    }
+                }
+
                 DragHandler {
                     id: dragHandler
                     target: null
-                    enabled: root.sortable
+                    // On touch, only arm the drag after a long-press primes it.
+                    enabled: root.sortable && (!MediaQuery.isTouchDevice || rowLongPress.pressed)
                     dragThreshold: 8
                     acceptedButtons: Qt.LeftButton
                     cursorShape: active ? Qt.ClosedHandCursor : Qt.OpenHandCursor

@@ -29,6 +29,12 @@ Item {
     property bool isLoading: false
     property alias loading: root.isLoading
 
+    // ── Mobile gesture opt-ins (see meta/mobile-gestures.md §6.7) ──────
+    // Fire a haptic feedback pattern on click. Style is chosen by variant:
+    //   primary/danger/success/warning  → impactLight
+    //   secondary/ghost/tonal/outline   → selection
+    property bool hapticOnTap: true
+
     // Icon configuration (mirrors React properties, falling back to older 'icon' and 'iconRight')
     property string leftIcon: ""
     property string rightIcon: ""
@@ -370,6 +376,12 @@ Item {
             ripple.height = 0
             ripple.opacity = 0.5
             rippleAnim.start()
+            // Mobile: fire a subtle haptic on tap. Style depends on variant —
+            // a filled button feels more "impactful" than a tonal/ghost one.
+            if (root.hapticOnTap && MediaQuery.isTouchDevice) {
+                var style = root.isSolidVariant ? "impactLight" : "selection"
+                MediaQuery.haptic(style)
+            }
             root.clicked()
         }
     }

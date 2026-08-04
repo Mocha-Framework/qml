@@ -32,6 +32,17 @@ Item {
     // Currently visible slide index
     property int currentIndex: 0
 
+    // ── Mobile gesture opt-ins (see meta/mobile-gestures.md §6.3) ──────
+    // Horizontal swipe to navigate between slides (replaces the previous
+    // crossfade-only behavior on touch devices).
+    property bool swipeToNavigate: true
+
+    // Pinch-to-zoom on the active image. Disabled by default because it
+    // can interfere with the swipe handler — turn on only when the
+    // carousel hosts images you actually want to inspect.
+    property bool pinchToZoom: false
+    property real maxZoom: 3.0
+
     // ==========================================
     // Signals
     // ==========================================
@@ -65,6 +76,30 @@ Item {
         id: slideArea
         anchors.fill: parent
         clip: true
+
+        // ── Mobile: swipe-to-navigate ────────────────────────────────────
+        SwipeGesture {
+            id: swipeNav
+            anchors.fill: parent
+            enabled: root.swipeToNavigate && root.slideCount > 1
+            threshold: 60
+            velocityThreshold: 400
+            axis: Qt.Horizontal
+            enabledDirections: ["left", "right"]
+
+            onSwiped: (direction, velocity) => {
+                autoTimer.restart()
+                if (direction === "left" && root.currentIndex < root.slideCount - 1) {
+                    root.currentIndex = root.currentIndex + 1
+                } else if (direction === "right" && root.currentIndex > 0) {
+                    root.currentIndex = root.currentIndex - 1
+                } else {
+                    // Wrap-around on edge swipes feels good with auto-advance
+                    if (direction === "left")  root.currentIndex = 0
+                    if (direction === "right") root.currentIndex = root.slideCount - 1
+                }
+            }
+        }
 
         // Background placeholder when empty
         Rectangle {
@@ -110,6 +145,55 @@ Item {
                     fillMode: Image.PreserveAspectCrop
                     asynchronous: true
                     cache: true
+
+                    // ── Mobile: pinch-to-zoom on the active image ─────────────
+                    // Wrap the PinchHandler so it only reacts when the carousel
+                    // is configured for it AND this is the current slide.
+                    readonly property bool __isActive: index === root.currentIndex
+                    readonly property bool __pinchEnabled: root.pinchToZoom && __isActive
+                    property real __zoomScale: 1.0
+                    property point __zoomOffset: Qt.point(0, 0)
+
+                    transformOrigin: Item.Center
+
+                    // Apply zoom by chaining a Scale transform to the image.
+                    // We use width/height scaling (not scale) so the image
+                    // continues to fill the slide and we keep PreserveAspectCrop.
+                    scale: __zoomScale
+
+                    PinchHandler {
+                        id: pinchZoom
+                        target: null
+                        enabled: heroImg.__pinchEnabled && heroImg.__zoomScale < root.maxZoom
+                        minimumScale: 1.0
+                        maximumScale: root.maxZoom
+
+                        property real __baseScale: 1.0
+                        onActiveChanged: {
+                            if (active) {
+                                __baseScale = heroImg.__zoomScale
+                            } else if (heroImg.__zoomScale < 1.05) {
+                                // Snap back to 1.0 if user didn't really zoom in.
+                                heroImg.__zoomScale = 1.0
+                            }
+                        }
+                        onScaleChanged: {
+                            heroImg.__zoomScale = Math.max(1.0, Math.min(root.maxZoom, __baseScale * scale))
+                        }
+                    }
+
+                    // Double-tap to reset / toggle zoom to 2×.
+                    TapHandler {
+                        enabled: heroImg.__pinchEnabled
+                        acceptedButtons: Qt.LeftButton
+                        onTapped: (eventPoint, button) => {
+                            if (heroImg.__zoomScale > 1.01) {
+                                heroImg.__zoomScale = 1.0
+                            } else {
+                                heroImg.__zoomScale = 2.0
+                            }
+                        }
+                    }
 
                     // Fade in when ready
                     opacity: status === Image.Ready ? 1.0 : 0.0

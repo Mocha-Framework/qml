@@ -25,13 +25,19 @@ Item {
     property int    openDelay: 300
     property int    closeDelay: 300
     property bool   disabled: false
-
-    property var    _origParent: null
+property var    _origParent: null
     property bool   _triggerHovered: false
     property bool   _cardHovered: false
     property string _actualPlacement: placement
-    
-    readonly property bool _shouldBeOpen: (_triggerHovered || _cardHovered) && !disabled
+
+    // Mobile: tap-to-toggle. When false on touch, the card stays closed.
+    property bool   _triggerPressed: false
+    readonly property bool __isTouch: MediaQuery.isTouchDevice
+    readonly property bool _shouldBeOpen: {
+        if (disabled) return false
+        if (root.__isTouch) return _triggerPressed
+        return _triggerHovered || _cardHovered
+    }
 
     on_ShouldBeOpenChanged: {
         if (_shouldBeOpen) {
@@ -48,13 +54,18 @@ Item {
     Timer { id: _openTimer; interval: root.openDelay; onTriggered: root._open() }
     Timer { id: _closeTimer; interval: root.closeDelay; onTriggered: root._close() }
 
+
     Component.onCompleted: {
         _origParent = parent;
         var r = parent;
         while (r && r.parent) r = r.parent;
-        
-        _triggerTracker.createObject(_origParent);
-        
+
+        if (root.__isTouch) {
+            _touchTracker.createObject(_origParent);
+        } else {
+            _triggerTracker.createObject(_origParent);
+        }
+
         root.parent = r;
     }
 
@@ -66,6 +77,32 @@ Item {
             acceptedButtons: Qt.NoButton
             onEntered: root._triggerHovered = true
             onExited: root._triggerHovered = false
+        }
+    }
+
+    // Mobile: tap trigger → open, tap trigger again (or outside) → close.
+    Component {
+        id: _touchTracker
+        Item {
+            anchors.fill: parent
+            TapHandler {
+                anchors.fill: parent
+                onTapped: {
+                    root._triggerPressed = !root._triggerPressed
+                }
+            }
+            // Dismiss on outside tap.
+            MouseArea {
+                anchors.fill: parent.parent ? parent.parent : parent
+                enabled: root._triggerPressed
+                z: -1
+                onClicked: (mouse) => {
+                    // If the click is outside _origParent, dismiss.
+                    if (_origParent && !_origParent.containsMouse) {
+                        root._triggerPressed = false
+                    }
+                }
+            }
         }
     }
 

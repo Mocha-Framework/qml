@@ -29,6 +29,20 @@ Item {
     property bool showCloseButton: true
     property bool usePortal: true
 
+    // ── Mobile gesture opt-ins (see meta/mobile-gestures.md §6.1) ──────
+    // Swipe the drawer in the direction it travels to dismiss it.
+    // Right-positioned drawers dismiss on swipe-left, etc.
+    property bool swipeToClose: true
+
+    // Opt-in: drag from the screen edge (same edge as the drawer lives on)
+    // to open the drawer. Disabled by default — left to apps that have
+    // a dedicated "edge swipe" affordance.
+    property bool edgeSwipeToOpen: false
+
+    // ── Snap-back animation when a swipe didn't cross threshold ─────────
+    // Adjusts the speed of the snap-back. Honors reduced-motion.
+    property int snapBackDuration: MediaQuery.prefersReducedMotion ? 0 : 220
+
     // Style overrides
     property real customRadius: -1
 
@@ -214,6 +228,23 @@ Item {
         }
     }
 
+    // ── Mobile: edge-swipe to open ──────────────────────────────────────
+    // Opt-in (off by default). When the user drags from the screen edge
+    // that matches `position`, fire `opened` and animate in.
+    EdgeSwipeGesture {
+        id: edgeOpener
+        anchors.fill: parent
+        enabled: root.edgeSwipeToOpen && !root.open && MediaQuery.isTouchDevice
+        edge: root.position
+        bandSize: 24
+        threshold: 60
+        z: -1   // sits behind the drawer container / backdrop
+
+        onEdgeSwiped: (edge, direction) => {
+            root.open = true
+        }
+    }
+
     // Drawer Sliding Content Card
     Rectangle {
         id: drawerContainer
@@ -228,6 +259,41 @@ Item {
 
         Behavior on color { ColorAnimation { duration: 150 } }
         Behavior on border.color { ColorAnimation { duration: 150 } }
+
+        // ── Mobile: swipe-to-close ──────────────────────────────────────
+        // The direction we accept is the direction the drawer would need
+        // to travel to leave the screen (right drawer → swipe left, etc.).
+        // The SwipeGesture handles both `swipeProgress` (drag-along) and
+        // `swiped` (commit). On commit we close; on cancel we let the
+        // existing State transition snap the drawer back to its slot.
+        SwipeGesture {
+            id: swipeCloser
+            anchors.fill: parent
+            enabled: root.swipeToClose && root.open
+            threshold: 60
+            velocityThreshold: 500
+            axis: {
+                if (root.position === "left" || root.position === "right") return Qt.Horizontal
+                return Qt.Vertical
+            }
+            enabledDirections: {
+                if (root.position === "right") return ["left"]
+                if (root.position === "left")  return ["right"]
+                if (root.position === "bottom") return ["up"]
+                if (root.position === "top")    return ["down"]
+                return []
+            }
+
+            onSwiped: (direction, velocity) => {
+                // Optional haptic on commit
+                if (MediaQuery.isTouchDevice) MediaQuery.haptic("impactLight")
+                root.open = false
+                root.closed()
+            }
+            onSwipeCanceled: {
+                // Snap back to current state — existing transition handles it.
+            }
+        }
 
         // Block mouse click propagation to backdrop
         MouseArea {

@@ -1,4 +1,4 @@
-import { defineQmlTests } from "@mocha/testkit";
+import { defineQmlTests } from "@mocha-framework/testkit";
 
 defineQmlTests({
   globs: ["../tst_*.qml"],

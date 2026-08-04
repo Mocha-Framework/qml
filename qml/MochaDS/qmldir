@@ -11,6 +11,7 @@ FadeIn FadeIn.qml
 FadeOut FadeOut.qml
 Flip Flip.qml
 GlowPulse GlowPulse.qml
+If If.qml
 Particles Particles.qml
 SlideDown SlideDown.qml
 SlideLeft SlideLeft.qml
@@ -125,3 +126,8 @@ ApplicationWindow ApplicationWindow.qml
 Drawer Drawer.qml
 HeroCarousel HeroCarousel.qml
 Window Window.qml
+SwipeGesture SwipeGesture.qml
+LongPressGesture LongPressGesture.qml
+PinchGesture PinchGesture.qml
+EdgeSwipeGesture EdgeSwipeGesture.qml
+PullToRefreshGesture PullToRefreshGesture.qml

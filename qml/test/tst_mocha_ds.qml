@@ -1551,10 +1551,96 @@ TestCase {
 
         carousel.destroy()
     }
+
+    // ==========================================
+    // Gesture Mixin Instantiation Tests
+    // (meta/mobile-gestures.md §5)
+    // ==========================================
+
+    function test_swipe_gesture_creation() {
+        var component = Qt.createComponent(Qt.resolvedUrl("../SwipeGesture.qml"))
+        compare(component.status, Component.Ready)
+        var gesture = component.createObject(null, { enabledDirections: ["left", "right"], threshold: 40 })
+        verify(gesture !== null)
+        compare(gesture.enabledDirections[0], "left")
+        compare(gesture.enabledDirections[1], "right")
+        compare(gesture.threshold, 40)
+        gesture.destroy()
+    }
+
+    function test_longpress_gesture_creation() {
+        var component = Qt.createComponent(Qt.resolvedUrl("../LongPressGesture.qml"))
+        compare(component.status, Component.Ready)
+        var gesture = component.createObject(null, { duration: 600, hapticOnTrigger: false })
+        verify(gesture !== null)
+        compare(gesture.duration, 600)
+        gesture.destroy()
+    }
+
+    function test_pinch_gesture_creation() {
+        var component = Qt.createComponent(Qt.resolvedUrl("../PinchGesture.qml"))
+        compare(component.status, Component.Ready)
+        var gesture = component.createObject(null, { minScale: 0.5, maxScale: 5.0 })
+        verify(gesture !== null)
+        compare(gesture.minScale, 0.5)
+        compare(gesture.maxScale, 5.0)
+        gesture.destroy()
+    }
+
+    function test_edge_swipe_gesture_creation() {
+        var component = Qt.createComponent(Qt.resolvedUrl("../EdgeSwipeGesture.qml"))
+        compare(component.status, Component.Ready)
+        var gesture = component.createObject(null, { edge: "left", bandSize: 20, threshold: 50 })
+        verify(gesture !== null)
+        compare(gesture.edge, "left")
+        compare(gesture.bandSize, 20)
+        gesture.destroy()
+    }
+
+    function test_pull_to_refresh_gesture_creation() {
+        var component = Qt.createComponent(Qt.resolvedUrl("../PullToRefreshGesture.qml"))
+        compare(component.status, Component.Ready)
+        var gesture = component.createObject(null, { threshold: 100 })
+        verify(gesture !== null)
+        compare(gesture.threshold, 100)
+        gesture.destroy()
+    }
+
+    // ==========================================
+    // Drawer swipe-to-close properties
+    // ==========================================
+    function test_drawer_swipe_properties() {
+        var component = Qt.createComponent(Qt.resolvedUrl("../Drawer.qml"))
+        compare(component.status, Component.Ready)
+        var drawer = component.createObject(null)
+        verify(drawer !== null)
+        compare(drawer.swipeToClose, true)
+        compare(drawer.edgeSwipeToOpen, false)
+        drawer.destroy()
+    }
+
+    // ==========================================
+    // Toast haptic + swipe properties
+    // ==========================================
+    function test_toast_mobile_properties() {
+        var component = Qt.createComponent(Qt.resolvedUrl("../Toast.qml"))
+        compare(component.status, Component.Ready)
+        var toast = component.createObject(null, { duration: 500 })
+        verify(toast !== null)
+        compare(toast.swipeToDismiss, true)
+        compare(toast.hapticOnAppear, true)
+        toast.destroy()
+    }
+
+    // ==========================================
+    // Button haptic property
+    // ==========================================
+    function test_button_haptic_property() {
+        var component = Qt.createComponent(Qt.resolvedUrl("../Button.qml"))
+        compare(component.status, Component.Ready)
+        var btn = component.createObject(null)
+        verify(btn !== null)
+        compare(btn.hapticOnTap, true)
+        btn.destroy()
+    }
 }
-
-
-
-
-
-

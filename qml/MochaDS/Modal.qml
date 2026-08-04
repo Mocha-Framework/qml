@@ -30,7 +30,6 @@ Item {
     // space is split evenly above and below the content (no awkward gap).
     property real minBodyHeight: 120
     // vertically inside the body via bodyFlickable.contentY).
-    property real minBodyHeight: 0
 
 
     // Configuration flags
@@ -38,6 +37,17 @@ Item {
     property bool closeOnEscape: true
     property bool showCloseButton: true
     property bool usePortal: true
+
+    // ── Mobile gesture opt-ins (see meta/mobile-gestures.md §6.2) ──────
+    // Swipe down on the modal content to dismiss. Only enabled when the
+    // modal is presented as a bottom sheet (`bottomSheetVariant: true`).
+    // For classic centered modals this stays disabled.
+    property bool swipeToDismiss: true
+
+    // Bottom sheet presentation — modal anchors to the bottom of the
+    // viewport and behaves like an iOS bottom sheet. Width = full,
+    // rounded top corners, swipe-down to dismiss.
+    property bool bottomSheetVariant: false
 
     // Slots
     default property alias content: customContentContainer.data
@@ -270,19 +280,45 @@ Item {
     // Modal Dialog Card
     Rectangle {
         id: modalContainer
-        anchors.centerIn: parent
-        width: root.finalWidth
+        // Bottom-sheet variant anchors to the bottom of the viewport with
+        // full width and rounded top corners; classic modals stay centered.
+        anchors.horizontalCenter: root.bottomSheetVariant ? undefined : parent.horizontalCenter
+        anchors.verticalCenter: root.bottomSheetVariant ? undefined : parent.verticalCenter
+        anchors.left: root.bottomSheetVariant ? parent.left : undefined
+        anchors.right: root.bottomSheetVariant ? parent.right : undefined
+        anchors.bottom: root.bottomSheetVariant ? parent.bottom : undefined
+        anchors.bottomMargin: root.bottomSheetVariant ? Theme.spacing.xl : 0
+        anchors.leftMargin: root.bottomSheetVariant ? Theme.spacing.xl : 0
+        anchors.rightMargin: root.bottomSheetVariant ? Theme.spacing.xl : 0
+        width: root.bottomSheetVariant ? Math.min(root.finalWidth, parent.width - Theme.spacing.xl * 2) : root.finalWidth
         height: root.finalHeight
         color: Theme.colors.base
-        radius: Theme.geometry.radiusLg
+        radius: root.bottomSheetVariant ? Theme.geometry.radiusLg : Theme.geometry.radiusLg
         border.color: Theme.colors.surface1
         border.width: Theme.geometry.borderSm
         clip: true
         opacity: 0.0
-        scale: 0.92
+        scale: root.bottomSheetVariant ? 1.0 : 0.92
 
         Behavior on color { ColorAnimation { duration: 150 } }
         Behavior on border.color { ColorAnimation { duration: 150 } }
+
+        // ── Mobile: swipe-down to dismiss (bottom-sheet only) ────────────
+        SwipeGesture {
+            id: swipeDismisser
+            anchors.fill: parent
+            enabled: root.swipeToDismiss && root.bottomSheetVariant && root.open
+            threshold: 80
+            velocityThreshold: 500
+            axis: Qt.Vertical
+            enabledDirections: ["down"]
+
+            onSwiped: (direction, velocity) => {
+                if (MediaQuery.isTouchDevice) MediaQuery.haptic("impactLight")
+                root.open = false
+                root.rejected()
+            }
+        }
 
         // Block mouse click propagation to backdrop
         MouseArea {

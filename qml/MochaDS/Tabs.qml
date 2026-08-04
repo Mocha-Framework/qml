@@ -29,11 +29,29 @@ Item {
 
     property bool sortable: false
 
+    // ── Mobile gesture opt-ins (see meta/mobile-gestures.md §6.4) ──────
+    // Horizontal swipe to switch tabs on touch devices.
+    property bool swipeToSwitch: true
+
+    // When sortable is true, drag-to-reorder must be primed by a long press
+    // (otherwise swipe-to-switch and reorder gestures fight for the same
+    // drag axis). Opt out of that protection to keep the old behavior.
+    property bool reorderRequiresLongPress: true
+
     // ── Drag Ghost visual ─────────────────────────
     property bool dragGhostEnabled: true
     property real dragGhostScale: 1.04
     property real dragGhostRotation: 2.5
     property real dragGhostElevation: 8
+
+    // ── Mobile: long-press to enter reorder mode (sortable + touch) ──────
+    readonly property bool __reorderMode: false
+    readonly property bool __isTouch: MediaQuery.isTouchDevice
+    readonly property bool __swipeEnabled:
+        swipeToSwitch
+        && __isTouch
+        && model && model.length > 1
+        && !(sortable && reorderRequiresLongPress && __reorderMode)
 
     // ==========================================
     // Internal Style Tokens & Helpers
@@ -123,6 +141,35 @@ Item {
         visible: root.variant === "line"
         z: 0
     }
+
+    // 3. Tabs row wrapper (holds the SwipeGesture + ListView)
+    Item {
+        id: tabRowWrapper
+        anchors.fill: parent
+
+        // ── Mobile: swipe-to-switch tabs ────────────────────────────────
+        // The DragHandler intercepts horizontal drags BEFORE the inner
+        // ListView sees them. If we commit, we change `currentIndex` and
+        // the ListView highlights the new tab without ever scrolling.
+        SwipeGesture {
+            id: swipeTabs
+            anchors.fill: parent
+            enabled: root.__swipeEnabled
+            threshold: 60
+            velocityThreshold: 400
+            axis: Qt.Horizontal
+            enabledDirections: ["left", "right"]
+
+            onSwiped: (direction, velocity) => {
+                if (direction === "left" && root.currentIndex < root.model.length - 1) {
+                    root.currentIndex = root.currentIndex + 1
+                    root.tabSelected(root.currentIndex, root.getId(root.model[root.currentIndex], root.currentIndex))
+                } else if (direction === "right" && root.currentIndex > 0) {
+                    root.currentIndex = root.currentIndex - 1
+                    root.tabSelected(root.currentIndex, root.getId(root.model[root.currentIndex], root.currentIndex))
+                }
+            }
+        }
 
     // 3. Tabs ListView
     ListView {
@@ -488,5 +535,7 @@ Item {
                         }
                     }
         }
-    }
+    }   // end ListView
+
+    }   // end tabRowWrapper
 }
